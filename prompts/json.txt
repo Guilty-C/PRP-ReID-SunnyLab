@@ -1,0 +1,3 @@
+Return a single-line JSON with fields:
+{"upper":{"type":"","color":""},"lower":{"type":"","color":""},"shoes":{"type":"","color":""},"bag":{"has":false,"type":"","color":""},"accessories":[],"special_cues":[]}
+Do not add extra text.

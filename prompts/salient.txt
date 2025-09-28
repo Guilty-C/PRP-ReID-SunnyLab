@@ -1,0 +1,6 @@
+List the most salient visual attributes that are robust across different cameras:
+- clothing upper/lower (type, color, pattern)
+- shoes (type, color)
+- carried items (bag, backpack, umbrella)
+- accessories (hat, glasses)
+- special cues (logos, stripes)

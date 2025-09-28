@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+.venv
+outputs/feats/
+outputs/runs/
+outputs/captions/
+outputs/attrs/
+data/
+.DS_Store

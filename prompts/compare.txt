@@ -1,0 +1,1 @@
+Compare two captions and highlight consistent attributes helpful for re-ID. Output bullet points only.

@@ -1,0 +1,90 @@
+# 提示词效果评估工具配置文件
+
+# CLIP模型配置
+clip:
+  model_name: "openai/clip-vit-base-patch32"
+  device: "auto"  # auto, cpu, cuda
+  batch_size: 8  # 批处理大小，根据内存情况调整
+  use_half_precision: true  # 是否使用半精度计算以加速和节省内存
+
+# Tokenizer配置
+tokenizer:
+  model_name: "gpt2"
+  fallback_method: "space_split"  # 当无法加载模型时的备选分词方法
+
+# 评分权重配置
+weights:
+  accuracy: 0.6  # 准确性权重
+  detail: 0.4    # 详细性权重
+
+# 属性类别配置
+attributes:
+  # 每个属性类别及其关键词列表
+  gender:
+    - "男"
+    - "女"
+    - "man"
+    - "woman"
+  top:
+    - "T恤"
+    - "衬衫"
+    - "夹克"
+    - "上衣"
+    - "外套"
+    - "毛衣"
+    - "卫衣"
+  bottom:
+    - "裤"
+    - "裙子"
+    - "牛仔裤"
+    - "短裤"
+  shoes:
+    - "鞋"
+    - "运动鞋"
+    - "靴子"
+    - "高跟鞋"
+  bag:
+    - "包"
+    - "背包"
+    - "手提包"
+    - "公文包"
+  accessories:
+    - "帽子"
+    - "眼镜"
+    - "围巾"
+    - "手套"
+
+# 输出配置
+output:
+  save_individual_results: true  # 是否保存每个样本的详细结果
+  pretty_print: true            # 是否美化JSON输出格式
+  sort_by: "final_score"        # 排序依据：final_score, info_score, tokens
+  sort_order: "descending"       # 排序顺序：ascending, descending
+
+# 性能优化配置
+performance:
+  cache_dir: "./cache"           # 缓存目录，用于存储模型和临时结果
+  use_cache: true               # 是否使用缓存
+  num_workers: 4                # 数据加载的并行工作进程数
+
+# 日志配置
+logging:
+  level: "INFO"                  # 日志级别：DEBUG, INFO, WARNING, ERROR
+  log_file: "./logs/prompt_evaluation.log"  # 日志文件路径
+  log_to_console: true           # 是否同时输出到控制台
+
+# 数据路径配置（这些可以被命令行参数覆盖）
+data_paths:
+  prompts_dir: "./prompts"
+  descriptions_file: null       # 必须通过命令行指定
+  images_dir: "./data/market1501/bounding_box_test"
+  output_file: "./outputs/prompt_evaluation.json"
+
+# 高级配置
+advanced:
+  # 如果启用，会使用FAISS加速大规模检索评估
+  use_faiss: false
+  # 评估时的随机种子，确保结果可复现
+  random_seed: 42
+  # 批处理时的进度条设置
+  show_progress_bar: true

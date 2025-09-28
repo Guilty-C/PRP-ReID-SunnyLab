@@ -1,0 +1,9 @@
+torch
+torchvision
+openai
+requests
+tqdm
+numpy
+pandas
+transformers
+# faiss-gpu 已移除，当前版本encode_clip.py使用随机向量作为占位符

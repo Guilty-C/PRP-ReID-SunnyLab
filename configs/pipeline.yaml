@@ -1,0 +1,28 @@
+# 流水线开关与参数
+prepare_data:
+  enable: true
+
+gen_caption:
+  enable: true
+  prompt: "prompts/base.txt"
+  batch_size: 16
+  max_tokens: 128
+
+parse_attrs:
+  enable: true
+  mode: "json"     # json | text
+  schema_prompt: "prompts/json.txt"
+
+encode_clip:
+  enable: true
+  model: "ViT-B/32"
+  normalize: true
+
+retrieve:
+  enable: true
+  topk: 50
+  rerank: false
+
+eval:
+  enable: true
+  metrics: ["mAP", "Rank-1"]
