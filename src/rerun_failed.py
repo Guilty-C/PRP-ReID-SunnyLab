@@ -113,7 +113,7 @@ def main():
 
     # 初始化 API
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+                    base_url="https://usa.vimsai.com/v1")
 
     # 读取已有 CSV → 内存字典
     rows = []

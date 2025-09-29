@@ -1,27 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluate CLIP retrieval results
+Evaluate CLIP retrieval results (Market1501 style, ignoring same-camera matches)
 - Input: JSON file (from retrieve.py)
 - Output: Average similarity, Rank-1, mAP
 """
 
 import argparse
 import json
+import os
 import numpy as np
 from tqdm import tqdm
 
+
+def parse_pid_cam(fname: str):
+    """
+    Market1501 文件名格式: 0001_c1s1_001051_00.jpg
+    - 前4位: person ID
+    - 第二段 'cX': camera ID
+    """
+    parts = os.path.basename(fname).split("_")
+    pid = parts[0]
+    cam = parts[1]  # e.g. 'c1s1' → camera = 'c1'
+    cam_id = cam[:2]  # 'c1'
+    return pid, cam_id
+
+
 def compute_map(results):
-    """Compute mean Average Precision"""
+    """Compute mean Average Precision (ignore same-camera matches)"""
     aps = []
     for qid, retrieved in results.items():
-        # ground truth is the same image_id
-        gt = qid
-        y_true = [1 if rid == gt else 0 for rid, _ in retrieved]
-        if sum(y_true) == 0:
+        q_pid, q_cam = parse_pid_cam(qid)
+
+        # 生成标签：同 PID 且不同摄像头才算正样本
+        y_true = []
+        for rid, _ in retrieved:
+            r_pid, r_cam = parse_pid_cam(rid)
+            if r_pid == q_pid and r_cam != q_cam:
+                y_true.append(1)
+            else:
+                y_true.append(0)
+
+        if sum(y_true) == 0:  # 没有正样本
             aps.append(0)
             continue
-        # precision at each hit
+
         precisions = []
         correct = 0
         for idx, val in enumerate(y_true, start=1):
@@ -30,6 +53,7 @@ def compute_map(results):
                 precisions.append(correct / idx)
         aps.append(np.mean(precisions))
     return np.mean(aps)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CLIP retrieval results")
@@ -48,7 +72,12 @@ def main():
             continue
         top1_id, top1_sim = retrieved[0]
         sims.append(top1_sim)
-        if top1_id == qid:
+
+        q_pid, q_cam = parse_pid_cam(qid)
+        t_pid, t_cam = parse_pid_cam(top1_id)
+
+        # Rank-1 只算不同摄像头的同 PID
+        if q_pid == t_pid and q_cam != t_cam:
             correct_top1 += 1
 
     avg_sim = np.mean(sims)
@@ -60,6 +89,7 @@ def main():
     print(f"Average Top-1 Similarity: {avg_sim:.4f}")
     print(f"Rank-1 Accuracy: {rank1*100:.2f}%")
     print(f"mAP: {mAP*100:.2f}%")
+
 
 if __name__ == "__main__":
     main()

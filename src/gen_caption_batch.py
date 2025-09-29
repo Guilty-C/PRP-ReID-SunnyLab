@@ -1,210 +1,132 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-修正版 JSON 模式 gen_caption_batch.py
-- 模型输出统一使用 "image_id"
-- 解析逻辑支持顺序兜底
-"""
+# gen_caption_batch.py —— 批量版，兼容 path/image_id，带 tqdm 进度条
 
 import os
-import sys
+import argparse
 import csv
 import json
-import base64
-import argparse
-import time
-import re
 from datetime import datetime
+from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from openai import OpenAI
+from transformers import GPT2Tokenizer
 
-def load_index(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    records = []
-    if ext == ".json":
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        records = data if isinstance(data, list) else [data]
-    elif ext == ".jsonl":
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    records.append(json.loads(line))
-    elif ext == ".txt":
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append({"image_id": line, "path": line, "split": ""})
-    else:
-        raise ValueError(f"不支持的索引文件类型: {ext}")
-    return records
+# 初始化分词器
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
-def encode_image_to_dataurl(path):
-    ext = os.path.splitext(path)[1].lower()
-    mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
-    with open(path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime};base64,{data}"
+# 初始化 VimsAI 客户端
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://usa.vimsai.com/v1"
+)
 
-def extract_json_array(text):
-    """正则提取 JSON 数组"""
-    match = re.search(r"\[.*\]", text, re.S)
-    if match:
-        return match.group(0)
-    return None
+def count_tokens(prompt_text: str) -> int:
+    try:
+        return len(tokenizer.encode(prompt_text))
+    except Exception as e:
+        print(f"[ERROR] token 统计失败: {e}")
+        return 0
 
-def call_model(client, batch, prompt_text):
-    system_msg = {
-        "role": "system",
-        "content": [{"type": "text", "text": "You are a precise assistant that outputs valid JSON only."}]
-    }
-
-    content = []
-    image_ids = [rec["image_id"] for rec in batch]
-
-    for rec in batch:
-        try:
-            data_url = encode_image_to_dataurl(rec["path"])
-            content.append({"type": "image_url", "image_url": {"url": data_url}})
-        except Exception:
-            content.append({"type": "image_url", "image_url": {"url": ""}})
-
-    # ✅ 改进后的 prompt
-    content.append({
-        "type": "text",
-        "text": (
-            f"{prompt_text}\n"
-            f"Input image_ids: {image_ids}\n"
-            f"Please output a JSON array. Each object must contain exactly two fields:\n"
-            f'  - "image_id": one from the input list\n'
-            f'  - "caption": an English description of the person\n\n'
-            f"Example:\n"
-            f"[\n"
-            f'  {{"image_id": "{image_ids[0]}", "caption": "A man in a blue shirt."}},\n'
-            f'  {{"image_id": "{image_ids[1]}", "caption": "A woman in a red jacket."}}\n'
-            f"]\n"
-            f"⚠️ Only output the JSON array, no explanations."
+def call_model(prompt_text: str) -> str:
+    """调用模型生成 caption"""
+    try:
+        resp = client.chat.completions.create(
+            "qwen-plus",   # ⚠️ 确认 VimsAI 支持的模型名
+            messages=[
+                {"role": "system", "content": "你是一个善于描述人物外观的助手，只描述人物可见外观"},
+                {"role": "user", "content": prompt_text}
+            ],
+            timeout=20
         )
-    })
-    user_msg = {"role": "user", "content": content}
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"[ERROR] {e}"
 
-    # ======== API 调用 + 解析 ========
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model="qwen-plus",
-                messages=[system_msg, user_msg]
-            )
-            content_list = resp.choices[0].message.content
-            text = ""
-            if isinstance(content_list, list):
-                text = "".join(seg.get("text", seg) if isinstance(seg, dict) else str(seg) for seg in content_list)
-            else:
-                text = str(content_list)
+def extract_image_id(rec: dict) -> str:
+    """统一提取 image_id"""
+    if "image_id" in rec:
+        return rec["image_id"]
+    if "path" in rec:
+        base = os.path.basename(rec["path"])
+        iid, _ = os.path.splitext(base)
+        return iid
+    return "UNKNOWN"
 
-            # 提取 JSON 数组
-            match = re.search(r"\[.*\]", text, re.S)
-            if not match:
-                raise ValueError("No JSON array found in response")
-            json_str = match.group(0)
-            data = json.loads(json_str)
+def load_index(index_file: str):
+    """支持 JSON / JSONL / TXT 三种索引文件"""
+    with open(index_file, "r", encoding="utf-8") as f:
+        content = f.read().strip()
 
-            captions = []
-            mapping = {str(d.get("image_id")): d.get("caption", "生成失败") for d in data if isinstance(d, dict)}
-            for idx, rec in enumerate(batch):
-                cap = mapping.get(str(rec["image_id"]))
-                if not cap:
-                    if idx < len(data) and isinstance(data[idx], dict):
-                        cap = data[idx].get("caption", "生成失败")
-                    else:
-                        cap = "生成失败"
-                captions.append(cap)
-            return captions
-        except Exception as e:
-            wait = 2 ** (attempt + 1)
-            print(f"[WARN] API 调用失败 (第 {attempt+1} 次): {e}, {wait}s 后重试...", file=sys.stderr)
-            time.sleep(wait)
+    try:
+        data = json.loads(content)
+        if isinstance(data, list):
+            return data
+    except json.JSONDecodeError:
+        pass
 
-    # ======== 如果全部失败，兜底 ========
-    return ["生成失败"] * len(batch)
-
+    # JSONL
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    try:
+        return [json.loads(ln) for ln in lines]
+    except Exception:
+        # TXT
+        return [{"image_id": ln.strip()} for ln in lines if ln.strip()]
 
 def main():
-    parser = argparse.ArgumentParser(description="批量生成图像描述 (Qwen API, JSON模式修正版)")
-    parser.add_argument("index_file", help="索引文件 (JSON / JSONL / TXT)")
-    parser.add_argument("--out", default="./outputs/captions", help="输出目录")
-    parser.add_argument("--num_workers", type=int, default=8, help="线程数")
-    parser.add_argument("--batch_size", type=int, default=1, help="每批图像数 (默认 1)")
-    parser.add_argument("--prompt_file", help="自定义 prompt 文件")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("index_file", type=str, help="索引文件(JSON/JSONL/TXT)")
+    parser.add_argument("--prompt_file", type=str, required=True, help="prompt 文件路径")
+    parser.add_argument("--out", type=str, required=True, help="输出 CSV 文件")
+    parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
+    parser.add_argument("--num_workers", type=int, default=4, help="线程数")
+    parser.add_argument("--verbose", action="store_true", help="是否逐条打印日志")
     args = parser.parse_args()
 
-    if args.prompt_file:
-        with open(args.prompt_file, "r", encoding="utf-8") as f:
-            prompt_text = f.read().strip()
-    else:
-        prompt_text = "请描述图像中的人物，包括性别、上衣颜色、下装、鞋子，以及是否背背包。"
+    # 读取 prompt
+    with open(args.prompt_file, "r", encoding="utf-8") as f:
+        prompt_text = f.read().strip()
+    prompt_tokens = count_tokens(prompt_text)
 
+    # 读取索引
     records = load_index(args.index_file)
-    if not records:
-        print("[ERROR] 索引为空")
-        return
+    total = len(records)
+    print(f"[gen_caption_batch] 共 {total} 条记录，将写入 {args.out}")
 
-    os.makedirs(args.out, exist_ok=True)
-    out_path = os.path.join(args.out, "captions.csv")
-    failed_path = os.path.join(args.out, "failed.jsonl")
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    tmp_out = args.out + ".tmp"
 
-    done_ids = set()
-    if os.path.exists(out_path):
-        with open(out_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                done_ids.add(row["image_id"])
+    with open(tmp_out, "w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["image_id", "path", "split", "prompt", "caption", "timestamp", "tokens"])
 
-    pending = [r for r in records if str(r.get("image_id")) not in done_ids]
-    if not pending:
-        print("[INFO] 已完成，无需生成")
-        return
+        # 分批处理
+        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            futures = {}
+            for i in range(0, total, args.batch_size):
+                batch = records[i:i + args.batch_size]
+                futures[executor.submit(process_batch, batch, prompt_text, prompt_tokens)] = batch
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="[gen_caption_batch] 生成中"):
+                captions = fut.result()
+                for row in captions:
+                    writer.writerow(row)
+                    if args.verbose:
+                        print(f"[gen_caption_batch] 已完成: {row[0]}")
 
-    write_header = not os.path.exists(out_path)
-    out_csv = open(out_path, "a", newline="", encoding="utf-8")
-    writer = csv.writer(out_csv)
-    if write_header:
-        writer.writerow(["image_id", "path", "split", "prompt", "caption", "timestamp"])
+    os.replace(tmp_out, args.out)
+    print(f"[gen_caption_batch] 任务完成 ✅ 输出文件: {args.out}")
 
-    batch_size = args.batch_size
-    batches = [pending[i:i+batch_size] for i in range(0, len(pending), batch_size)]
-
-    failed_records = []
-    with ThreadPoolExecutor(max_workers=args.num_workers) as ex:
-        futures = {ex.submit(call_model, client, batch, prompt_text): idx for idx, batch in enumerate(batches)}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="处理批次"):
-            idx = futures[fut]
-            batch = batches[idx]
-            captions = fut.result()
-            for rec, cap in zip(batch, captions):
-                ts = datetime.now().isoformat()
-                writer.writerow([rec.get("image_id"), rec.get("path"), rec.get("split"),
-                                 prompt_text, cap, ts])
-                if cap == "生成失败":
-                    failed_records.append(rec)
-            out_csv.flush()
-
-    out_csv.close()
-
-    if failed_records:
-        with open(failed_path, "w", encoding="utf-8") as f:
-            for rec in failed_records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"[WARN] {len(failed_records)} 条生成失败，记录在 {failed_path}")
-    else:
-        print("[INFO] 全部生成成功 ✅")
-
-    print(f"[INFO] 已完成，结果保存到 {out_path}")
+def process_batch(batch, prompt_text, prompt_tokens):
+    rows = []
+    for rec in batch:
+        image_id = extract_image_id(rec)
+        path = rec.get("path", "")
+        split = rec.get("split", "")
+        user_prompt = f"{prompt_text}\n图像ID: {image_id}"
+        caption = call_model(user_prompt)
+        timestamp = datetime.now().isoformat()
+        rows.append([image_id, path, split, prompt_text, caption, timestamp, prompt_tokens])
+    return rows
 
 if __name__ == "__main__":
     main()
