@@ -1,0 +1,13 @@
+Describe the person in the image by providing detailed attributes in JSON format. Focus only on objective, visible characteristics that can help distinguish individuals. Include the following attributes:
+
+- gender: "male" or "female"
+- top: The type and color of the top garment (e.g., "light blue short-sleeved shirt")
+- bottom: The type and color of the bottom garment (e.g., "black pants")
+- shoes: The type and color of shoes (e.g., "white sneakers")
+- accessories: A list of any visible accessories (e.g., ["black backpack", "sunglasses"])
+- hairstyle: Description of hair (e.g., "short black hair", "long curly hair")
+- body_shape: General body build (e.g., "slim", "athletic", "stocky")
+- pose: Any distinctive posture or actions (e.g., "carrying a bag over the shoulder", "hands in pockets")
+- distinctive_features: Any other unique visual details that can help identify the person
+
+Output only the JSON object with these fields, no additional text.

@@ -29,6 +29,16 @@ def load_captions(path: str):
         raise ValueError(f"不支持的文件格式: {path}")
     return records
 
+def load_images_from_dir(img_dir):
+    exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG"]
+    img_paths = []
+    for ext in exts:
+        img_paths.extend(glob.glob(os.path.join(img_dir, ext)))
+    img_paths = sorted(img_paths)
+    if not img_paths:
+        raise FileNotFoundError(f"❌ No images found in {img_dir}. Supported extensions: {exts}")
+    return img_paths
+
 
 def encode_image(model, processor, img_path, device):
     image = Image.open(img_path).convert("RGB")
@@ -75,6 +85,7 @@ def main():
     gallery = {}
     files = [f for f in os.listdir(args.gallery) if f.lower().endswith((".jpg", ".png"))]
     for fname in tqdm(files, desc="Encoding gallery images"):
+        # 2. 读取图片路径
         img_path = os.path.join(args.gallery, fname)
         gallery[fname] = encode_image(model, processor, img_path, device)
 

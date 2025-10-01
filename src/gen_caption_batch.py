@@ -31,7 +31,7 @@ def call_model(prompt_text: str) -> str:
     """调用模型生成 caption"""
     try:
         resp = client.chat.completions.create(
-            "qwen-plus",   # ⚠️ 确认 VimsAI 支持的模型名
+            model="qwen-plus",   # 修复为命名参数 model=
             messages=[
                 {"role": "system", "content": "你是一个善于描述人物外观的助手，只描述人物可见外观"},
                 {"role": "user", "content": prompt_text}

@@ -1,1 +1,4 @@
-Describe the person in the image in one or two sentences, focusing only on objective, visible attributes. Include the person's gender and specifics of their clothing (the type and color of their top and bottom garments), their shoes, and any visible accessories (such as a hat, glasses, or a bag). Use clear, specific language and avoid any mention of the background, location, or subjective impressions.
+Describe the person in one short sentence, focusing only on clear, visible attributes that distinguish them. 
+Always include gender, the color and type of top, the color and type of bottom, the color and type of shoes, 
+and any obvious accessories like a backpack, hat, or glasses. 
+Keep the description concise, natural, and no longer than 20 words.
