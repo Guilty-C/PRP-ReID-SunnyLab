@@ -1,0 +1,4 @@
+token_price_per_1k: 0.002
+GPU_cost_per_hr: 0.50
+monthly_offline_tokens: 0
+monthly_queries: 100000
