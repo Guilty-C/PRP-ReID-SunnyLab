@@ -106,7 +106,33 @@ python src/retrieve.py \
   --topk 20
 ```
 
-The script loads `openai/clip-vit-base-patch32` by default, encodes captions and gallery images on the fly, and writes the top-K ranked file names with cosine similarities.
+The script loads `openai/clip-vit-base-patch32` by default, encodes captions, and retrieves the top-K gallery matches by cosine similarity.
+
+**Persistent gallery cache.** `retrieve.py` automatically caches gallery embeddings under `outputs/cache/gallery/` (configurable via `--gallery_cache`). The first run scans/encodes the entire gallery and writes three files:
+
+- `embeddings.npy`: float32/float16 matrix of gallery features (set with `--dtype`).
+- `manifest.csv`: tracks each image path, size/mtime (ETag), optional SHA1 (`--hash sha1`), and index.
+- `meta.json`: CLIP model metadata and cache schema (`cache_version=1`).
+
+Subsequent runs reuse the cache and only encode new or modified files. Deleted files are dropped from the manifest automatically. Use `--rebuild_cache` to force a full refresh. Large datasets can be memory-mapped by reusing the saved `.npy` file and switching to `--dtype fp16` if you need to shrink disk/memory usage.
+
+**Optional FAISS index.** Pass `--save_faiss` (and optionally `--faiss_path`) to persist a `faiss.index` alongside the cache. If the gallery is unchanged, `retrieve.py` loads the serialized FAISS index instead of rebuilding. Without FAISS, cosine search runs fully in-memory.
+
+Additional knobs:
+
+```bash
+python src/retrieve.py \
+  --captions outputs/market_pipeline/exp001/captions.csv \
+  --gallery datasets/Market-1501/bounding_box_test \
+  --out outputs/market_pipeline/exp001/retrieval_top20.json \
+  --gallery_cache outputs/cache/gallery \
+  --batch_size 64 \
+  --num_workers 0 \
+  --hash sha1 \
+  --save_faiss
+```
+
+Windows users should keep `--num_workers 0` (default). Linux defaults to 2 workers for faster disk throughput.
 
 ## 6. Offline Caption/Attribute Generation
 
