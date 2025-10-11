@@ -46,6 +46,26 @@ pip install -r requirements.txt
 
 Tested on Python 3.10.13, PyTorch 2.1.0+cu121, CUDA 12.1 with an RTX 4060. Set `DATA_DIR` (e.g., `export DATA_DIR=$(pwd)/datasets`) or pass `--data_root` flags so scripts can locate datasets.
 
+## Run on GPU (Windows, NVIDIA)
+
+1. Install a CUDA-enabled PyTorch build:
+
+   ```bash
+   pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
+   ```
+
+2. Launch training with GPU + AMP enabled:
+
+   ```bash
+   python -u src/train_reid_baseline.py \
+     --device cuda --precision amp --channels_last --num_workers 4 \
+     --clean_root "D:/.../market1501_clean" --manifest ".../train_manifest_full.csv" \
+     --splits ".../splits.json" --outdir ".../outputs/market1501_full_gpu" \
+     --epochs 5 --batch 64 --pk_p 16 --pk_k 4
+   ```
+
+Troubleshooting: if you see `CUDA requested but not available`, double-check your NVIDIA driver, confirm `torch.version.cuda` matches the installed wheel, and verify `python -c "import torch; print(torch.cuda.is_available())"` returns `True`.
+
 ## Clean → Train → Eval (Market-1501)
 
 Use the washed Market-1501 training images for supervised learning, then evaluate on the official test split (`query/` + `bounding_box_test/`). Paths with spaces should stay wrapped in quotes. Windows PowerShell/CMD use backslashes, while Git Bash requires escaping them (e.g., `D:\\PRP SunnyLab\\...`).
