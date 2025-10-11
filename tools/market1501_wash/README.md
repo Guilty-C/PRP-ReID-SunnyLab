@@ -1,32 +1,53 @@
-# Market-1501 Washing Utility
+# Market-1501 Washer (cross-platform)
 
-This tool prepares a cleaned Market-1501 training subset that is suitable for
-classification-style pre-training. It removes low-quality images, prunes
-near-duplicates, and selects a camera-balanced "core" subset for each identity.
+Utility script for cleaning the Market-1501 training split. It indexes the
+dataset, filters out blurry or tiny images, removes near-duplicates, and builds
+both a "full clean" training set and a balanced core subset per identity.
 
-## Installation
+## Setup
 
 ```bash
 cd tools/market1501_wash
-python -m venv .venv && . .venv/bin/activate    # or .venv\Scripts\activate on Windows
+python -m venv .venv
+# Activate:
+# macOS/Linux (bash/zsh)
+. .venv/bin/activate
+# Windows (Git Bash)
+. .venv/Scripts/activate
+# Windows (CMD)
+.venv\Scripts\activate.bat
+# Windows (PowerShell)
+./.venv/Scripts/Activate.ps1
+
 pip install -r requirements.txt
 ```
 
-## Usage
+## Run
 
 ```bash
+# Example (Windows paths with spaces -> quote them)
 python wash_market1501.py \
-  --src /path/to/Market-1501-v15.09.15 \
-  --dst ../../data/market1501_clean \
+  --src "D:\\datasets\\Market-1501-v15.09.15" \
+  --dst "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean" \
   --core_per_id 6 --blur_th 80 --dup_hamming 6 --min_imgs_per_id 4
 ```
 
+Tips:
+
+* `--src` should point to the folder that contains `bounding_box_train`. The
+  washer also recognises common wrapper layouts such as
+  `Market-1501/bounding_box_train` and `Market-1501-v15.09.15/bounding_box_train`.
+* Paths are normalised, so both Windows (`C:\\...`) and POSIX (`/home/...`)
+  layouts are supported. Always wrap paths that include spaces in quotes.
+* Use `--dry-run` to validate the dataset and print counts without copying
+  files.
+
 ## Outputs
 
-After the script completes, the destination directory will contain:
+After a successful run, the destination directory contains:
 
 ```
-data/market1501_clean/
+market1501_clean/
   train_full_clean/
     0001/*.jpg
     0002/*.jpg
@@ -37,10 +58,10 @@ data/market1501_clean/
   wash_stats.txt
 ```
 
-## Notes
+## Common issues
 
-* Only images inside `bounding_box_train/` are read.
-* The process prepares data for consistent backbone training; it does not
-  compute evaluation metrics such as mAP or Rank-1.
-* Thresholds (`--blur_th`, `--dup_hamming`, etc.) are configurable to match the
-  quality of your local dataset copy.
+* **"'bounding_box_train' not found"** – Ensure `--src` is the dataset root and
+  refer back to the layout tips above.
+* **Virtual environment activation on Windows** – Use the script that matches
+  your shell (Git Bash/CMD/PowerShell) as shown in the setup instructions.
+
