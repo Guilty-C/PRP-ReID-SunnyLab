@@ -17,7 +17,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.cuda import amp
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -279,7 +278,12 @@ def extract_features(
             if compute_loss and stats is not None:
                 triplet_feat = F.normalize(global_feat, dim=1)
                 targets = torch.tensor(
-                    [pid_to_label[int(x)] for x in pid.tolist()],
+                    (
+                        # 验证/评估阶段不需要映射，若传入 None 或缺项则回退到原始 pid
+                        [pid_to_label.get(int(x), -1) for x in pid.tolist()]
+                        if pid_to_label
+                        else [int(x) for x in pid.tolist()]
+                    ),
                     device=device,
                 )
                 ce_loss = ce_criterion(logits, targets)
@@ -316,7 +320,7 @@ def evaluate_split(
     args: argparse.Namespace,
     ce_criterion: nn.Module,
     triplet_margin: float,
-    pid_to_label: Dict[int, int],
+    pid_to_label: Dict[int, int] | None = None,
 ) -> Tuple[float, Dict[int, float], TrainStats | None]:
     feats, pids, camids, _, stats = extract_features(
         model,
@@ -367,7 +371,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: AdamW,
-    scaler: amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     ce_criterion: nn.Module,
     triplet_margin: float,
@@ -397,13 +401,15 @@ def train_epoch(
         _args=args,
     )
 
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+
     for iteration, (images, pids, _camids, _paths) in enumerate(train_bar, 1):
         images = images.to(device, non_blocking=True)
         pids = pids.to(device)
         targets = torch.tensor([pid_to_label[int(pid)] for pid in pids.tolist()], device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        with amp.autocast(enabled=scaler.is_enabled()):
+        with torch.amp.autocast(autocast_device, enabled=scaler.is_enabled()):
             global_feat, bn_feat, logits = model(images)
             norm_feat = F.normalize(global_feat, dim=1)
             ce_loss = ce_criterion(logits, targets)
@@ -559,7 +565,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, epochs=args.epochs, warmup_epochs=10)
-    scaler = amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler(
+        device_type=device.type,
+        enabled=(device.type == "cuda"),
+    )
     ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     triplet_margin = 0.3
 
@@ -600,7 +609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args=args,
             ce_criterion=ce_criterion,
             triplet_margin=triplet_margin,
-            pid_to_label=pid_to_label,
+            pid_to_label=None,
         )
         scheduler.step()
 
