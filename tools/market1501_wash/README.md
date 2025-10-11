@@ -1,11 +1,19 @@
-# Market-1501 Washer (cross-platform)
+# Market-1501 Washer (Cross-Platform)
 
-Utility script for cleaning the Market-1501 training split. It indexes the
-dataset, filters out blurry or tiny images, removes near-duplicates, and builds
-both a "full clean" training set and a balanced core subset per identity.
+This tool cleans the Market-1501 training split by filtering tiny/blurred images and removing near-duplicates.  
+**Tested on Windows (CMD/PowerShell/Git Bash), macOS, and Linux.**
+
+## Prerequisites
+- Python ≥ 3.9
+- A local copy of **Market-1501**. Your `--src` must be the folder that **directly contains** `bounding_box_train/`.
+  - Typical layouts accepted:
+    ```
+    <SRC>/bounding_box_train/
+    <SRC>/Market-1501/bounding_box_train/
+    <SRC>/Market-1501-v15.09.15/bounding_box_train/
+    ```
 
 ## Setup
-
 ```bash
 cd tools/market1501_wash
 python -m venv .venv
@@ -17,51 +25,76 @@ python -m venv .venv
 # Windows (CMD)
 .venv\Scripts\activate.bat
 # Windows (PowerShell)
-./.venv/Scripts/Activate.ps1
+.\.venv\Scripts\Activate.ps1
 
 pip install -r requirements.txt
 ```
 
-## Run
+## Run (Examples)
+
+### Windows (PowerShell/CMD)
+
+```powershell
+python wash_market1501.py `
+  --src "D:\PRP SunnyLab\reid-prompt\data\market1501" `
+  --dst "D:\PRP SunnyLab\reid-prompt\data\market1501_clean" `
+  --core_per_id 6 --blur_th 80 --dup_hamming 6 --min_imgs_per_id 4
+```
+
+### Windows (Git Bash)
 
 ```bash
-# Example (Windows paths with spaces -> quote them)
 python wash_market1501.py \
-  --src "D:\\datasets\\Market-1501-v15.09.15" \
+  --src "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501" \
   --dst "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean" \
   --core_per_id 6 --blur_th 80 --dup_hamming 6 --min_imgs_per_id 4
 ```
 
-Tips:
+### macOS/Linux
 
-* `--src` should point to the folder that contains `bounding_box_train`. The
-  washer also recognises common wrapper layouts such as
-  `Market-1501/bounding_box_train` and `Market-1501-v15.09.15/bounding_box_train`.
-* Paths are normalised, so both Windows (`C:\\...`) and POSIX (`/home/...`)
-  layouts are supported. Always wrap paths that include spaces in quotes.
-* Use `--dry-run` to validate the dataset and print counts without copying
-  files.
+```bash
+python wash_market1501.py \
+  --src ~/datasets/Market-1501-v15.09.15 \
+  --dst ./_market1501_clean \
+  --core_per_id 6 --blur_th 80 --dup_hamming 6 --min_imgs_per_id 4
+```
 
-## Outputs
+### Dry-Run (validate + index only)
 
-After a successful run, the destination directory contains:
+```bash
+python wash_market1501.py --src "<SRC>" --dst "<DST>" --dry_run
+```
+
+## Expected Layout
+
+The tool will look for:
 
 ```
-market1501_clean/
-  train_full_clean/
-    0001/*.jpg
-    0002/*.jpg
-  train_core/
-    0001/*.jpg
-    0002/*.jpg
-  market1501_index.csv
+<SRC>/bounding_box_train/
+```
+
+It will create:
+
+```
+<DST>/
   wash_stats.txt
+  ... (cleaned images by ID)
 ```
 
-## Common issues
+## Troubleshooting
 
-* **"'bounding_box_train' not found"** – Ensure `--src` is the dataset root and
-  refer back to the layout tips above.
-* **Virtual environment activation on Windows** – Use the script that matches
-  your shell (Git Bash/CMD/PowerShell) as shown in the setup instructions.
+* **Error: 'Could not locate `bounding_box_train`'**
+  Ensure `--src` is the folder that directly contains `bounding_box_train`.
+  Accepted wrappers include `Market-1501/` and `Market-1501-v15.09.15/`.
 
+* **WARNING skip reason=invalid_filename**
+  The tool now parses standard Market-1501 names like `1500_c6s3_086542_02.jpg`.
+  If you see this warning, check for unrelated files or rename them to the Market-1501 pattern.
+
+* **Paths with spaces (Windows)**
+  Always quote your paths, e.g. `"D:\PRP SunnyLab\reid-prompt\data\market1501"`.
+
+## Notes
+
+* Extensions `.jpg/.jpeg/.png` are supported (case-insensitive).
+* PID `-1` files are treated as junk and omitted from the cleaned splits but are still indexed for reporting.
