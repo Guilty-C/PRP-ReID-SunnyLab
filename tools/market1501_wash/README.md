@@ -65,6 +65,26 @@ python wash_market1501.py \
 python wash_market1501.py --src "<SRC>" --dst "<DST>" --dry_run
 ```
 
+## Export manifest
+
+After washing, create a manifest and deterministic train/val split from the cleaned folder:
+
+### Windows (PowerShell)
+
+```powershell
+python export_manifest.py `
+  --relative --posix_paths `
+  "D:\PRP SunnyLab\reid-prompt\data\market1501_clean"
+```
+
+### Windows (Git Bash)
+
+```bash
+python export_manifest.py \
+  --relative --posix_paths \
+  "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean"
+```
+
 ## Expected Layout
 
 The tool will look for:
