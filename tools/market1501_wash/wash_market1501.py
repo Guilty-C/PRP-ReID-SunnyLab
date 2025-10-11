@@ -14,7 +14,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import imagehash
@@ -86,18 +86,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=4,
         help="Minimum number of images per identity after filtering",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate paths and report dataset statistics without writing outputs",
+    )
     return parser.parse_args(argv)
 
 
 def validate_source(root: Path) -> Path:
     """Validate source directory structure and return training directory."""
+    root = Path(root).expanduser().resolve()
+    candidates = [
+        root / "bounding_box_train",
+        root / "Market-1501" / "bounding_box_train",
+        root / "Market-1501-v15.09.15" / "bounding_box_train",
+    ]
 
-    train_dir = root / "bounding_box_train"
-    if not train_dir.exists() or not train_dir.is_dir():
-        raise FileNotFoundError(
-            f"Expected bounding_box_train/ under {root}. Found: {train_dir}"
-        )
-    return train_dir
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    search_patterns = [
+        "bounding_box_train",
+        "*/bounding_box_train",
+        "*/*/bounding_box_train",
+    ]
+    for pattern in search_patterns:
+        for found in root.glob(pattern):
+            if found.is_dir():
+                return found.resolve()
+
+    tried_paths = "\n  - " + "\n  - ".join(path.as_posix() for path in candidates)
+    raise FileNotFoundError(
+        "Could not locate 'bounding_box_train' under source root.\n"
+        f"Source root checked: {root.as_posix()}\n"
+        f"Tried:{tried_paths}\n\n"
+        "Tips:\n"
+        "  • Ensure --src points to the Market-1501 root (the folder that contains 'bounding_box_train').\n"
+        "  • See tools/market1501_wash/README.md for examples on Windows/macOS/Linux."
+    )
 
 
 def parse_metadata(image_path: Path) -> Tuple[str, int]:
@@ -127,17 +155,22 @@ def compute_image_metrics(image_path: Path) -> Tuple[int, int, float, imagehash.
     return height, width, blur_score, phash
 
 
-def index_dataset(train_dir: Path, dst_dir: Path) -> List[ImageRecord]:
+def index_dataset(train_dir: Path, dst_dir: Optional[Path]) -> List[ImageRecord]:
     """Index images, run basic filters, and write metadata CSV."""
 
     records: List[ImageRecord] = []
-    csv_path = dst_dir / "market1501_index.csv"
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+    writer: Optional[csv.writer] = None
+    csv_file = None
+    if dst_dir is not None:
+        csv_path = dst_dir / "market1501_index.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = csv_path.open("w", newline="", encoding="utf-8")
         writer = csv.writer(csv_file)
         writer.writerow(["path", "pid", "camid", "h", "w"])
-        image_paths = sorted(train_dir.glob("*.jpg"))
-        LOGGER.info("phase=index total_files=%d", len(image_paths))
+
+    image_paths = sorted(train_dir.glob("*.jpg"))
+    LOGGER.info("phase=index total_files=%d", len(image_paths))
+    try:
         for img_path in image_paths:
             try:
                 pid_str, camid = parse_metadata(img_path)
@@ -148,7 +181,8 @@ def index_dataset(train_dir: Path, dst_dir: Path) -> List[ImageRecord]:
                 continue
 
             rel_path = str(img_path.relative_to(train_dir.parent))
-            writer.writerow([rel_path, pid_str, camid, height, width])
+            if writer is not None:
+                writer.writerow([rel_path, pid_str, camid, height, width])
             record = ImageRecord(
                 path=img_path,
                 rel_path=rel_path,
@@ -161,6 +195,9 @@ def index_dataset(train_dir: Path, dst_dir: Path) -> List[ImageRecord]:
                 phash=phash,
             )
             records.append(record)
+    finally:
+        if csv_file is not None:
+            csv_file.close()
     LOGGER.info("phase=index indexed=%d", len(records))
     return records
 
@@ -311,29 +348,42 @@ def run(cfg: argparse.Namespace) -> None:
     """Main execution pipeline."""
 
     configure_logging()
+    src = Path(cfg.src).expanduser().resolve()
+    dst = Path(cfg.dst).expanduser().resolve()
+    dry_run = bool(getattr(cfg, "dry_run", False))
     LOGGER.info(
-        "phase=start src=%s dst=%s min_side=%d blur_th=%.2f dup_hamming=%d core_per_id=%d min_imgs_per_id=%d",
-        cfg.src,
-        cfg.dst,
+        "phase=start src=%s dst=%s min_side=%d blur_th=%.2f dup_hamming=%d core_per_id=%d min_imgs_per_id=%d dry_run=%s",
+        src.as_posix(),
+        dst.as_posix(),
         cfg.min_side,
         cfg.blur_th,
         cfg.dup_hamming,
         cfg.core_per_id,
         cfg.min_imgs_per_id,
+        dry_run,
     )
 
-    train_dir = validate_source(cfg.src)
-    cfg.dst.mkdir(parents=True, exist_ok=True)
+    train_dir = validate_source(src)
+    LOGGER.info("phase=validate train_dir=%s", train_dir.as_posix())
+    dst.mkdir(parents=True, exist_ok=True)
 
     stats = WashStats()
 
-    indexed_records = index_dataset(train_dir, cfg.dst)
+    indexed_records = index_dataset(train_dir, None if dry_run else dst)
     filtered_records = apply_quality_filters(indexed_records, cfg, stats)
     deduped_records = deduplicate(filtered_records, cfg, stats)
     grouped_records = filter_identities(deduped_records, cfg.min_imgs_per_id)
 
-    full_clean_dir = cfg.dst / "train_full_clean"
-    core_dir = cfg.dst / "train_core"
+    if dry_run:
+        LOGGER.info(
+            "phase=dry_run_result ids=%d images=%d",
+            len(grouped_records),
+            sum(len(records) for records in grouped_records.values()),
+        )
+        return
+
+    full_clean_dir = dst / "train_full_clean"
+    core_dir = dst / "train_core"
     full_clean_dir.mkdir(parents=True, exist_ok=True)
     core_dir.mkdir(parents=True, exist_ok=True)
 
@@ -350,13 +400,13 @@ def run(cfg: argparse.Namespace) -> None:
             len(core_subset),
         )
 
-    stats_path = cfg.dst / "wash_stats.txt"
+    stats_path = dst / "wash_stats.txt"
     write_stats_file(stats_path, stats, len(grouped_records), total_kept_images)
     LOGGER.info(
         "phase=done ids=%d images=%d stats_path=%s",
         len(grouped_records),
         total_kept_images,
-        stats_path,
+        stats_path.as_posix(),
     )
 
 
