@@ -96,6 +96,39 @@ python src/train_reid_baseline.py \
   --epochs 120 --batch 64 --height 256 --width 128 --lr 3.5e-4 --seed 42
 ```
 
+Progress controls:
+
+- `--no_progress` 禁用所有进度条，回退到定期打印日志。
+- `--force_progress` 即使输出被 `tee`/重定向也强制保留进度条。
+- `--progress_ascii` 使用 ASCII 渲染，避免 Windows 终端或日志文件中的乱码。
+- `--progress_refresh N` 每 `N` 个 batch 更新一次统计信息（默认 10）。
+
+记录训练日志时可以结合 `--progress_ascii` 与 `--force_progress`，确保进度条在非 TTY 环境下仍可读：
+
+```bash
+# Git Bash：训练并保存日志
+python -u src/train_reid_baseline.py \
+  --clean_root "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean" \
+  --manifest  "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\train_manifest.csv" \
+  --splits    "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\splits.json" \
+  --outdir    "D:\\PRP SunnyLab\\reid-prompt\\outputs\\market1501_clean_baseline" \
+  --epochs 120 --batch 64 --height 256 --width 128 --lr 3.5e-4 --seed 42 \
+  --progress_ascii --force_progress \
+  2>&1 | tee "./train_$(date +%Y%m%d_%H%M%S).log"
+```
+
+```powershell
+# PowerShell：训练并保存日志
+python -u src/train_reid_baseline.py `
+  --clean_root "D:\PRP SunnyLab\reid-prompt\data\market1501_clean" `
+  --manifest  "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\train_manifest.csv" `
+  --splits    "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\splits.json" `
+  --outdir    "D:\PRP SunnyLab\reid-prompt\outputs\market1501_clean_baseline" `
+  --epochs 120 --batch 64 --height 256 --width 128 --lr 3.5e-4 --seed 42 `
+  --progress_ascii --force_progress `
+  2>&1 | Tee-Object -FilePath ".\train_$(Get-Date -Format yyyyMMdd_HHmmss).log"
+```
+
 ### 3. Evaluate on the official Market-1501 test split (original query/test folders)
 
 PowerShell / CMD:
@@ -115,6 +148,8 @@ python src/extract_and_eval_market1501.py \
   --test_root "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501" \
   --outdir "D:\\PRP SunnyLab\\reid-prompt\\outputs\\market1501_clean_baseline\\eval"
 ```
+
+评估脚本同样支持上述进度控制开关，可在重定向日志或 Windows 终端中保持进度条稳定显示。
 
 ## 2. Dataset Layouts
 

@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -19,6 +22,40 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torchvision.models import ResNet50_Weights, resnet50
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback when tqdm missing
+    tqdm = None
+
+
+def make_tqdm(iterable, **kw):
+    args = kw.pop("_args", None)
+    if tqdm is None:
+        if not getattr(make_tqdm, "_warned", False):
+            print("tqdm is not installed. Run `pip install tqdm>=4.66` to enable progress bars.")
+            make_tqdm._warned = True
+        return iterable
+    if getattr(args, "no_progress", False) and not getattr(args, "force_progress", False):
+        return iterable
+    disable = kw.pop("disable", False)
+    if not sys.stdout.isatty() and not getattr(args, "force_progress", False):
+        disable = True
+    ascii_opt = getattr(args, "progress_ascii", False) or None
+    return tqdm(iterable, disable=disable, ascii=ascii_opt, **kw)
+
+
+make_tqdm._warned = False  # type: ignore[attr-defined]
+
+
+def progress_write(message: str) -> None:
+    if tqdm is not None:
+        try:
+            tqdm.write(message)
+            return
+        except Exception:  # pragma: no cover - tqdm edge case
+            pass
+    print(message)
 
 from data.market1501_clean import (
     Market1501CleanDataset,
@@ -92,6 +129,9 @@ def market1501_metrics(
     query_camids: Sequence[int],
     gallery_camids: Sequence[int],
     ranks: Tuple[int, ...] = (1, 5, 10),
+    *,
+    progress_args=None,
+    progress_position: int | None = None,
 ) -> Tuple[float, Dict[int, float]]:
     q_pids = np.asarray(query_pids)
     g_pids = np.asarray(gallery_pids)
@@ -109,7 +149,13 @@ def market1501_metrics(
     aps: List[float] = []
     num_valid_q = 0
 
-    for q_idx in range(num_q):
+    tqdm_kwargs = {"desc": "Match", "leave": False}
+    if progress_position is not None:
+        tqdm_kwargs["position"] = progress_position
+
+    query_iter = make_tqdm(range(num_q), _args=progress_args, **tqdm_kwargs)
+
+    for q_idx in query_iter:
         q_pid = q_pids[q_idx]
         q_cam = q_camids[q_idx]
         order = indices[q_idx]
@@ -192,33 +238,110 @@ def extract_features(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> Tuple[torch.Tensor, List[int], List[int], List[str]]:
+    *,
+    args: argparse.Namespace | None = None,
+    desc: str = "Extract",
+    position: int | None = None,
+    ce_criterion: nn.Module | None = None,
+    triplet_margin: float | None = None,
+    pid_to_label: Dict[int, int] | None = None,
+) -> Tuple[torch.Tensor, List[int], List[int], List[str], TrainStats | None]:
     model.eval()
     feats: List[torch.Tensor] = []
     pids: List[int] = []
     camids: List[int] = []
     paths: List[str] = []
 
+    compute_loss = ce_criterion is not None and triplet_margin is not None and pid_to_label is not None
+    stats = TrainStats() if compute_loss else None
+    refresh = max(1, getattr(args, "progress_refresh", 10)) if args is not None else 10
+    start_time = time.time()
+    processed = 0
+
+    tqdm_kwargs = {"desc": desc, "leave": False}
+    if position is not None:
+        tqdm_kwargs["position"] = position
+
+    feature_bar = make_tqdm(loader, _args=args, **tqdm_kwargs)
+
     with torch.no_grad():
-        for images, pid, cam, path in loader:
+        for idx, (images, pid, cam, path) in enumerate(feature_bar, 1):
             images = images.to(device, non_blocking=True)
-            _, bn_feat, _ = model(images)
+            pid_dev = pid.to(device)
+            global_feat, bn_feat, logits = model(images)
             norm_feat = F.normalize(bn_feat, dim=1)
             feats.append(norm_feat.cpu())
             pids.extend(int(x) for x in pid)
             camids.extend(int(x) for x in cam)
             paths.extend(path)
+            processed += images.size(0)
+
+            if compute_loss and stats is not None:
+                triplet_feat = F.normalize(global_feat, dim=1)
+                targets = torch.tensor(
+                    [pid_to_label[int(x)] for x in pid.tolist()],
+                    device=device,
+                )
+                ce_loss = ce_criterion(logits, targets)
+                tri_loss = hard_triplet_loss(triplet_feat, pid_dev, margin=triplet_margin)
+                total_loss = ce_loss + tri_loss
+                stats.loss += total_loss.item() * images.size(0)
+                stats.ce_loss += ce_loss.item() * images.size(0)
+                stats.triplet_loss += tri_loss.item() * images.size(0)
+                preds = logits.argmax(dim=1)
+                stats.acc += (preds == targets).float().sum().item()
+                stats.count += images.size(0)
+
+            if idx % refresh == 0 and hasattr(feature_bar, "set_postfix"):
+                elapsed = max(time.time() - start_time, 1e-6)
+                postfix = {"img/s": f"{processed / elapsed:.1f}"}
+                if compute_loss and stats is not None and stats.count:
+                    postfix["loss"] = f"{stats.loss / stats.count:.4f}"
+                feature_bar.set_postfix(postfix)
 
     features = torch.cat(feats, dim=0) if feats else torch.empty(0, device="cpu")
-    return features, pids, camids, paths
+    if stats is not None and stats.count:
+        stats.loss /= stats.count
+        stats.ce_loss /= stats.count
+        stats.triplet_loss /= stats.count
+        stats.acc /= stats.count
+    return features, pids, camids, paths, stats
 
 
-def evaluate_split(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, Dict[int, float]]:
-    feats, pids, camids, _ = extract_features(model, loader, device)
+def evaluate_split(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    args: argparse.Namespace,
+    ce_criterion: nn.Module,
+    triplet_margin: float,
+    pid_to_label: Dict[int, int],
+) -> Tuple[float, Dict[int, float], TrainStats | None]:
+    feats, pids, camids, _, stats = extract_features(
+        model,
+        loader,
+        device,
+        args=args,
+        desc="Val",
+        position=1,
+        ce_criterion=ce_criterion,
+        triplet_margin=triplet_margin,
+        pid_to_label=pid_to_label,
+    )
     if feats.numel() == 0:
-        return 0.0, {1: 0.0, 5: 0.0, 10: 0.0}
+        return 0.0, {1: 0.0, 5: 0.0, 10: 0.0}, stats
     distmat = cosine_distance_matrix(feats, feats)
-    return market1501_metrics(distmat, pids, pids, camids, camids)
+    metrics = market1501_metrics(
+        distmat,
+        pids,
+        pids,
+        camids,
+        camids,
+        progress_args=args,
+        progress_position=2,
+    )
+    return metrics[0], metrics[1], stats
 
 
 def build_scheduler(optimizer: AdamW, epochs: int, warmup_epochs: int) -> LambdaLR:
@@ -251,11 +374,30 @@ def train_epoch(
     pid_to_label: Dict[int, int],
     print_freq: int,
     epoch: int,
+    *,
+    args: argparse.Namespace,
 ) -> TrainStats:
     model.train()
     stats = TrainStats()
+    refresh = max(1, getattr(args, "progress_refresh", 10))
+    start_time = time.time()
+    processed = 0
+    loader_len = len(loader)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:  # pragma: no cover - CPU or unsupported devices
+            pass
 
-    for iteration, (images, pids, _camids, _paths) in enumerate(loader):
+    train_bar = make_tqdm(
+        loader,
+        desc="Train",
+        position=1,
+        leave=False,
+        _args=args,
+    )
+
+    for iteration, (images, pids, _camids, _paths) in enumerate(train_bar, 1):
         images = images.to(device, non_blocking=True)
         pids = pids.to(device)
         targets = torch.tensor([pid_to_label[int(pid)] for pid in pids.tolist()], device=device)
@@ -281,17 +423,44 @@ def train_epoch(
             preds = logits.argmax(dim=1)
             stats.acc += (preds == targets).float().sum().item()
             stats.count += images.size(0)
+            processed += images.size(0)
 
-        if (iteration + 1) % print_freq == 0:
-            avg_loss = stats.loss / stats.count
-            avg_ce = stats.ce_loss / stats.count
-            avg_tri = stats.triplet_loss / stats.count
-            avg_acc = stats.acc / stats.count
-            print(
-                f"Epoch {epoch} Iter {iteration + 1}/{len(loader)}"
-                f" | Loss: {avg_loss:.4f} (CE: {avg_ce:.4f}, Tri: {avg_tri:.4f})"
-                f" | Acc: {avg_acc:.3f}"
-            )
+        if iteration % refresh == 0:
+            avg_loss = stats.loss / max(1, stats.count)
+            avg_ce = stats.ce_loss / max(1, stats.count)
+            avg_tri = stats.triplet_loss / max(1, stats.count)
+            avg_acc = stats.acc / max(1, stats.count)
+            if hasattr(train_bar, "set_postfix"):
+                lr = optimizer.param_groups[0]["lr"]
+                elapsed = max(time.time() - start_time, 1e-6)
+                imgs_per_s = processed / elapsed
+                postfix = {
+                    "loss": f"{avg_loss:.4f}",
+                    "ce": f"{avg_ce:.4f}",
+                    "tri": f"{avg_tri:.4f}",
+                    "acc": f"{avg_acc:.3f}",
+                    "lr": f"{lr:.2e}",
+                    "img/s": f"{imgs_per_s:.1f}",
+                }
+                if torch.cuda.is_available():
+                    try:
+                        mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                        postfix["mem"] = f"{mem:.0f}MB"
+                    except Exception:  # pragma: no cover - CPU fallback
+                        pass
+                train_bar.set_postfix(postfix)
+            elif (iteration % max(1, print_freq) == 0) or (iteration == loader_len):
+                progress_write(
+                    "Epoch {epoch} Iter {iter_idx}/{total} | Loss: {loss:.4f} (CE: {ce:.4f}, Tri: {tri:.4f}) | Acc: {acc:.3f}".format(
+                        epoch=epoch,
+                        iter_idx=iteration,
+                        total=loader_len,
+                        loss=avg_loss,
+                        ce=avg_ce,
+                        tri=avg_tri,
+                        acc=avg_acc,
+                    )
+                )
 
     stats.loss /= max(1, stats.count)
     stats.ce_loss /= max(1, stats.count)
@@ -316,7 +485,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pk_p", type=int, default=16)
     parser.add_argument("--pk_k", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--print_freq", type=int, default=20)
+    parser.add_argument("--print_freq", type=int, default=20, help="Logging frequency when progress bars are disabled")
+    parser.add_argument("--no_progress", action="store_true", help="禁用进度条")
+    parser.add_argument("--force_progress", action="store_true", help="即使非TTY也显示进度条")
+    parser.add_argument("--progress_ascii", action="store_true", help="用ASCII渲染进度条（Windows/日志更稳）")
+    parser.add_argument(
+        "--progress_refresh",
+        type=int,
+        default=10,
+        help="batch 间隔多少步刷新一次后缀信息",
+    )
     return parser.parse_args(argv)
 
 
@@ -329,9 +507,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.outdir = args.outdir.expanduser().resolve()
 
     if args.batch != args.pk_p * args.pk_k:
-        print(
-            f"Warning: --batch ({args.batch}) does not equal --pk_p * --pk_k ({args.pk_p * args.pk_k})."
-            " Using PK sampler batch size."
+        progress_write(
+            f"Warning: --batch ({args.batch}) does not equal --pk_p * --pk_k ({args.pk_p * args.pk_k}). Using PK sampler batch size."
         )
 
     set_seed(args.seed)
@@ -362,6 +539,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
     )
 
+    if args.num_workers > 0 and os.name == "nt":
+        progress_write("Hint: Windows 下如遇 DataLoader 卡顿，可尝试 --num_workers 0")
+
+    progress_write("Warming up first batch ...")
+    for loader_name, loader in (("train", train_loader), ("val", val_loader)):
+        try:
+            iterator = iter(loader)
+            next(iterator)
+            progress_write(f"{loader_name.capitalize()} loader ready.")
+        except StopIteration:
+            progress_write(f"{loader_name.capitalize()} loader is empty.")
+        except Exception as exc:  # pragma: no cover - dataloader backend issues
+            progress_write(f"Failed to warm up {loader_name} loader: {exc}")
+    progress_write("Dataloaders ready.")
+
     model = ReIDBaseline(num_classes=len(pid_to_label))
     model.to(device)
 
@@ -369,11 +561,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     scheduler = build_scheduler(optimizer, epochs=args.epochs, warmup_epochs=10)
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
     ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    triplet_margin = 0.3
 
     best_map = -1.0
     best_epoch = -1
 
-    for epoch in range(1, args.epochs + 1):
+    epoch_bar = make_tqdm(
+        range(1, args.epochs + 1),
+        desc="Epoch",
+        position=0,
+        leave=True,
+        _args=args,
+    )
+
+    for epoch in epoch_bar:
         train_sampler = train_loader.batch_sampler
         if isinstance(train_sampler, PKSampler):
             train_sampler.set_epoch(epoch)
@@ -385,23 +586,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             scaler,
             device,
             ce_criterion,
-            triplet_margin=0.3,
+            triplet_margin=triplet_margin,
             pid_to_label=pid_to_label,
             print_freq=args.print_freq,
             epoch=epoch,
+            args=args,
         )
 
-        val_map, val_cmc = evaluate_split(model, val_loader, device)
+        val_map, val_cmc, val_stats = evaluate_split(
+            model,
+            val_loader,
+            device,
+            args=args,
+            ce_criterion=ce_criterion,
+            triplet_margin=triplet_margin,
+            pid_to_label=pid_to_label,
+        )
         scheduler.step()
 
-        print(
+        summary = (
             f"Epoch {epoch:03d}/{args.epochs} | Loss {stats.loss:.4f} | "
             f"CE {stats.ce_loss:.4f} | Triplet {stats.triplet_loss:.4f} | Acc {stats.acc:.3f}"
         )
-        print(
+        progress_write(summary)
+        if val_stats is not None:
+            progress_write(
+                f"Val Loss {val_stats.loss:.4f} | CE {val_stats.ce_loss:.4f} | Triplet {val_stats.triplet_loss:.4f} | Acc {val_stats.acc:.3f}"
+            )
+        progress_write(
             f"Validation mAP: {val_map:.4f} | "
             f"CMC@1: {val_cmc.get(1, 0.0):.4f} | CMC@5: {val_cmc.get(5, 0.0):.4f} | CMC@10: {val_cmc.get(10, 0.0):.4f}"
         )
+
+        if hasattr(epoch_bar, "set_postfix"):
+            postfix = {"train_loss": f"{stats.loss:.4f}", "val_mAP": f"{val_map:.4f}"}
+            if val_stats is not None:
+                postfix["val_loss"] = f"{val_stats.loss:.4f}"
+            epoch_bar.set_postfix(postfix)
 
         ckpt = {
             "epoch": epoch,
@@ -419,9 +640,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             best_map = val_map
             best_epoch = epoch
             torch.save(ckpt, args.outdir / "best.pth")
-            print(f"New best model at epoch {epoch} with mAP {val_map:.4f}")
+            progress_write(f"New best model at epoch {epoch} with mAP {val_map:.4f}")
 
-    print(f"Training complete. Best mAP {best_map:.4f} at epoch {best_epoch}.")
+    progress_write(f"Training complete. Best mAP {best_map:.4f} at epoch {best_epoch}.")
     return 0
 
 
