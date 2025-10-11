@@ -277,15 +277,12 @@ def extract_features(
 
             if compute_loss and stats is not None:
                 triplet_feat = F.normalize(global_feat, dim=1)
-                targets = torch.tensor(
-                    (
-                        # 验证/评估阶段不需要映射，若传入 None 或缺项则回退到原始 pid
-                        [pid_to_label.get(int(x), -1) for x in pid.tolist()]
-                        if pid_to_label
-                        else [int(x) for x in pid.tolist()]
-                    ),
-                    device=device,
+                labels = (
+                    [pid_to_label.get(int(x), -1) for x in pid.tolist()]
+                    if pid_to_label
+                    else [int(x) for x in pid.tolist()]
                 )
+                targets = torch.tensor(labels, device=device)
                 ce_loss = ce_criterion(logits, targets)
                 tri_loss = hard_triplet_loss(triplet_feat, pid_dev, margin=triplet_margin)
                 total_loss = ce_loss + tri_loss
@@ -322,6 +319,7 @@ def evaluate_split(
     triplet_margin: float,
     pid_to_label: Dict[int, int] | None = None,
 ) -> Tuple[float, Dict[int, float], TrainStats | None]:
+    progress_write("INFO eval: using raw PIDs (no mapping).")
     feats, pids, camids, _, stats = extract_features(
         model,
         loader,
@@ -331,7 +329,7 @@ def evaluate_split(
         position=1,
         ce_criterion=ce_criterion,
         triplet_margin=triplet_margin,
-        pid_to_label=pid_to_label,
+        pid_to_label=None,
     )
     if feats.numel() == 0:
         return 0.0, {1: 0.0, 5: 0.0, 10: 0.0}, stats
@@ -401,7 +399,7 @@ def train_epoch(
         _args=args,
     )
 
-    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    _autocast_device = "cuda" if device.type == "cuda" else "cpu"
 
     for iteration, (images, pids, _camids, _paths) in enumerate(train_bar, 1):
         images = images.to(device, non_blocking=True)
@@ -409,7 +407,7 @@ def train_epoch(
         targets = torch.tensor([pid_to_label[int(pid)] for pid in pids.tolist()], device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(autocast_device, enabled=scaler.is_enabled()):
+        with torch.amp.autocast(_autocast_device, enabled=scaler.is_enabled()):
             global_feat, bn_feat, logits = model(images)
             norm_feat = F.normalize(global_feat, dim=1)
             ce_loss = ce_criterion(logits, targets)
@@ -565,10 +563,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, epochs=args.epochs, warmup_epochs=10)
-    scaler = torch.amp.GradScaler(
-        device_type=device.type,
-        enabled=(device.type == "cuda"),
-    )
+    scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu")
     ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     triplet_margin = 0.3
 
