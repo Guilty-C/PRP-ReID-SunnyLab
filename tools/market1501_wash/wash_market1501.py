@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import shutil
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,10 @@ from PIL import Image
 
 
 LOGGER = logging.getLogger("market1501_wash")
-FILENAME_PATTERN = re.compile(r"([\-\d]{1,5})_c(\d)s\d+_.*\\.jpg", re.IGNORECASE)
+MARKET_RE = re.compile(
+    r"^(?P<pid>-?\d{1,5})_c(?P<cam>\d)s(?P<seq>\d)_(?P<frame>\d{3,7})_(?P<idx>\d{2})\.(?:jpg|jpeg|png)$",
+    re.IGNORECASE,
+)
 RNG = random.Random(42)
 
 
@@ -88,15 +92,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dry-run",
+        "--dry_run",
+        dest="dry_run",
         action="store_true",
-        help="Validate paths and report dataset statistics without writing outputs",
+        help="Validate and index only; no copying or writes",
     )
     return parser.parse_args(argv)
 
 
-def validate_source(root: Path) -> Path:
+def validate_source(src: Path) -> Path:
     """Validate source directory structure and return training directory."""
-    root = Path(root).expanduser().resolve()
+
+    root = Path(src).expanduser().resolve()
     candidates = [
         root / "bounding_box_train",
         root / "Market-1501" / "bounding_box_train",
@@ -107,39 +114,43 @@ def validate_source(root: Path) -> Path:
         if candidate.is_dir():
             return candidate.resolve()
 
-    search_patterns = [
-        "bounding_box_train",
-        "*/bounding_box_train",
-        "*/*/bounding_box_train",
-    ]
-    for pattern in search_patterns:
-        for found in root.glob(pattern):
-            if found.is_dir():
-                return found.resolve()
+    try_paths: List[Path] = []
+    for found in root.rglob("bounding_box_train"):
+        try:
+            rel_parts = found.relative_to(root).parts
+        except ValueError:
+            continue
+        if len(rel_parts) <= 3 and found.is_dir():
+            return found.resolve()
+        try_paths.append(found)
 
-    tried_paths = "\n  - " + "\n  - ".join(path.as_posix() for path in candidates)
+    tried_lines = [c.as_posix() for c in candidates]
+    tried_lines.extend(tp.as_posix() for tp in try_paths[:5])
+    tried = "\n  - " + "\n  - ".join(tried_lines) if tried_lines else ""
     raise FileNotFoundError(
         "Could not locate 'bounding_box_train' under source root.\n"
         f"Source root checked: {root.as_posix()}\n"
-        f"Tried:{tried_paths}\n\n"
+        f"Tried:{tried}\n\n"
         "Tips:\n"
-        "  • Ensure --src points to the Market-1501 root (the folder that contains 'bounding_box_train').\n"
-        "  • See tools/market1501_wash/README.md for examples on Windows/macOS/Linux."
+        "  • Ensure --src points to the folder that directly contains 'bounding_box_train'.\n"
+        "  • See tools/market1501_wash/README.md for Windows/macOS/Linux examples."
     )
 
 
-def parse_metadata(image_path: Path) -> Tuple[str, int]:
-    """Extract person id and camera id from a Market-1501 filename."""
+def parse_market_filename(path: Path) -> Optional[Dict[str, int]]:
+    """Parse Market-1501 filename components from basename."""
 
-    match = FILENAME_PATTERN.match(image_path.name)
+    match = MARKET_RE.fullmatch(path.name)
     if not match:
-        raise ValueError(f"Filename does not match Market-1501 pattern: {image_path.name}")
-    pid_str, camid_str = match.groups()
-    pid_int = int(pid_str)
-    camid = int(camid_str)
-    if pid_int <= 0:
-        raise ValueError(f"Invalid pid {pid_int} for file {image_path.name}")
-    return pid_str, camid
+        return None
+    groups = match.groupdict()
+    return {
+        "pid": int(groups["pid"]),
+        "cam": int(groups["cam"]),
+        "seq": int(groups["seq"]),
+        "frame": int(groups["frame"]),
+        "idx": int(groups["idx"]),
+    }
 
 
 def compute_image_metrics(image_path: Path) -> Tuple[int, int, float, imagehash.ImageHash]:
@@ -155,7 +166,7 @@ def compute_image_metrics(image_path: Path) -> Tuple[int, int, float, imagehash.
     return height, width, blur_score, phash
 
 
-def index_dataset(train_dir: Path, dst_dir: Optional[Path]) -> List[ImageRecord]:
+def index_dataset(train_dir: Path, dst_dir: Optional[Path]) -> Tuple[List[ImageRecord], int, int]:
     """Index images, run basic filters, and write metadata CSV."""
 
     records: List[ImageRecord] = []
@@ -168,38 +179,60 @@ def index_dataset(train_dir: Path, dst_dir: Optional[Path]) -> List[ImageRecord]
         writer = csv.writer(csv_file)
         writer.writerow(["path", "pid", "camid", "h", "w"])
 
-    image_paths = sorted(train_dir.glob("*.jpg"))
-    LOGGER.info("phase=index total_files=%d", len(image_paths))
+    total_files = 0
+    skipped_files = 0
     try:
-        for img_path in image_paths:
+        for img_path in sorted(train_dir.iterdir()):
+            if not img_path.is_file():
+                continue
+            if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            total_files += 1
+            meta = parse_market_filename(img_path)
+            if meta is None:
+                skipped_files += 1
+                LOGGER.warning(
+                    "skip reason=invalid_filename path=%s",
+                    img_path.as_posix(),
+                )
+                continue
             try:
-                pid_str, camid = parse_metadata(img_path)
-                pid_int = int(pid_str)
                 height, width, blur_score, phash = compute_image_metrics(img_path)
-            except (ValueError, OSError, IOError) as exc:
-                LOGGER.warning("event=skip reason=invalid_file path=%s error=%s", img_path, exc)
+            except (OSError, IOError, ValueError) as exc:
+                skipped_files += 1
+                LOGGER.warning(
+                    "skip reason=unreadable path=%s error=%s",
+                    img_path.as_posix(),
+                    exc,
+                )
                 continue
 
-            rel_path = str(img_path.relative_to(train_dir.parent))
-            if writer is not None:
-                writer.writerow([rel_path, pid_str, camid, height, width])
+            rel_path = img_path.relative_to(train_dir).as_posix()
+            pid_int = meta["pid"]
             record = ImageRecord(
                 path=img_path,
                 rel_path=rel_path,
-                pid=pid_str,
+                pid=f"{pid_int:04d}" if pid_int >= 0 else str(pid_int),
                 pid_int=pid_int,
-                camid=camid,
+                camid=meta["cam"],
                 height=height,
                 width=width,
                 blur_score=blur_score,
                 phash=phash,
             )
+            if writer is not None:
+                writer.writerow([rel_path, record.pid, record.camid, height, width])
             records.append(record)
     finally:
         if csv_file is not None:
             csv_file.close()
-    LOGGER.info("phase=index indexed=%d", len(records))
-    return records
+    LOGGER.info(
+        "phase=index total=%d indexed=%d skipped=%d",
+        total_files,
+        len(records),
+        skipped_files,
+    )
+    return records, total_files, skipped_files
 
 
 def apply_quality_filters(
@@ -263,26 +296,37 @@ def deduplicate(records: Sequence[ImageRecord], cfg: argparse.Namespace, stats: 
     return deduped
 
 
-def filter_identities(records: Sequence[ImageRecord], min_imgs_per_id: int) -> Dict[str, List[ImageRecord]]:
-    """Group by person id and drop identities with too few images."""
+def filter_identities(
+    records: Sequence[ImageRecord], min_imgs_per_id: int
+) -> Tuple[Dict[str, List[ImageRecord]], int, int]:
+    """Group by person id and drop identities with too few images or junk ids."""
 
     grouped: Dict[str, List[ImageRecord]] = defaultdict(list)
     for record in records:
         grouped[record.pid].append(record)
 
     filtered: Dict[str, List[ImageRecord]] = {}
+    dropped_low = 0
+    dropped_junk = 0
     for pid, items in grouped.items():
+        if items and items[0].pid_int < 0:
+            dropped_junk += 1
+            LOGGER.info("phase=filter_ids pid=%s reason=junk_id count=%d", pid, len(items))
+            continue
         if len(items) >= min_imgs_per_id:
             filtered[pid] = sorted(items, key=lambda rec: (rec.camid, rec.path.name))
         else:
+            dropped_low += 1
             LOGGER.info("phase=filter_ids pid=%s reason=too_few_images count=%d", pid, len(items))
     LOGGER.info(
-        "phase=filter_ids total_ids=%d kept_ids=%d min_imgs=%d",
+        "phase=filter_ids total_ids=%d kept_ids=%d dropped_low=%d dropped_junk=%d min_imgs=%d",
         len(grouped),
         len(filtered),
+        dropped_low,
+        dropped_junk,
         min_imgs_per_id,
     )
-    return filtered
+    return filtered, dropped_low, dropped_junk
 
 
 def copy_images(records: Iterable[ImageRecord], dst_dir: Path) -> None:
@@ -333,12 +377,25 @@ def select_core_subset(records: Sequence[ImageRecord], core_per_id: int) -> List
     return selected
 
 
-def write_stats_file(stats_path: Path, stats: WashStats, kept_ids: int, kept_images: int) -> None:
+def write_stats_file(
+    stats_path: Path,
+    stats: WashStats,
+    kept_ids: int,
+    kept_images: int,
+    indexed_total: int,
+    skipped_files: int,
+    dropped_low: int,
+    dropped_junk: int,
+) -> None:
     """Write washing statistics to a text file."""
 
     with stats_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"Indexed files: {indexed_total}\n")
+        handle.write(f"Skipped during indexing: {skipped_files}\n")
         handle.write(f"IDs kept: {kept_ids}\n")
         handle.write(f"Images kept (full_clean): {kept_images}\n")
+        handle.write(f"IDs dropped (< min_imgs): {dropped_low}\n")
+        handle.write(f"IDs dropped (junk -1): {dropped_junk}\n")
         handle.write(f"Rejected blur: {stats.rejected_blur}\n")
         handle.write(f"Rejected tiny: {stats.rejected_tiny}\n")
         handle.write(f"Rejected dupes: {stats.rejected_dupes}\n")
@@ -365,22 +422,25 @@ def run(cfg: argparse.Namespace) -> None:
 
     train_dir = validate_source(src)
     LOGGER.info("phase=validate train_dir=%s", train_dir.as_posix())
-    dst.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        dst.mkdir(parents=True, exist_ok=True)
 
-    stats = WashStats()
-
-    indexed_records = index_dataset(train_dir, None if dry_run else dst)
-    filtered_records = apply_quality_filters(indexed_records, cfg, stats)
-    deduped_records = deduplicate(filtered_records, cfg, stats)
-    grouped_records = filter_identities(deduped_records, cfg.min_imgs_per_id)
+    records, total_files, skipped_files = index_dataset(train_dir, None if dry_run else dst)
 
     if dry_run:
         LOGGER.info(
-            "phase=dry_run_result ids=%d images=%d",
-            len(grouped_records),
-            sum(len(records) for records in grouped_records.values()),
+            "summary total=%d indexed=%d skipped=%d", total_files, len(records), skipped_files
         )
-        return
+        LOGGER.info("phase=exit reason=dry_run")
+        sys.exit(0)
+
+    stats = WashStats()
+
+    filtered_records = apply_quality_filters(records, cfg, stats)
+    deduped_records = deduplicate(filtered_records, cfg, stats)
+    grouped_records, dropped_low, dropped_junk = filter_identities(
+        deduped_records, cfg.min_imgs_per_id
+    )
 
     full_clean_dir = dst / "train_full_clean"
     core_dir = dst / "train_core"
@@ -401,7 +461,26 @@ def run(cfg: argparse.Namespace) -> None:
         )
 
     stats_path = dst / "wash_stats.txt"
-    write_stats_file(stats_path, stats, len(grouped_records), total_kept_images)
+    write_stats_file(
+        stats_path,
+        stats,
+        len(grouped_records),
+        total_kept_images,
+        total_files,
+        skipped_files,
+        dropped_low,
+        dropped_junk,
+    )
+    LOGGER.info(
+        "summary indexed=%d skipped=%d kept_ids=%d kept_images=%d rejected_blur=%d rejected_tiny=%d rejected_dupes=%d",
+        total_files,
+        skipped_files,
+        len(grouped_records),
+        total_kept_images,
+        stats.rejected_blur,
+        stats.rejected_tiny,
+        stats.rejected_dupes,
+    )
     LOGGER.info(
         "phase=done ids=%d images=%d stats_path=%s",
         len(grouped_records),
