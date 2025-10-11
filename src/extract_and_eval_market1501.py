@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import List, Sequence
 
@@ -15,7 +17,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from data.market1501_clean import build_market1501_transforms
-from train_reid_baseline import ReIDBaseline, cosine_distance_matrix, market1501_metrics
+from train_reid_baseline import (
+    ReIDBaseline,
+    cosine_distance_matrix,
+    make_tqdm,
+    market1501_metrics,
+    progress_write,
+)
 
 
 MARKET_RE = re.compile(
@@ -60,15 +68,35 @@ def list_images(folder: Path) -> List[Path]:
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
 
-def extract_features(model: ReIDBaseline, loader: DataLoader, device: torch.device):
+def extract_features(
+    model: ReIDBaseline,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    args: argparse.Namespace,
+    desc: str,
+    position: int,
+):
     feats: List[torch.Tensor] = []
     pids: List[int] = []
     camids: List[int] = []
     paths: List[str] = []
 
     model.eval()
+    refresh = max(1, getattr(args, "progress_refresh", 10))
+    start_time = time.time()
+    processed = 0
+
+    feature_bar = make_tqdm(
+        loader,
+        desc=desc,
+        position=position,
+        leave=True,
+        _args=args,
+    )
+
     with torch.no_grad():
-        for images, pid, cam, path in loader:
+        for idx, (images, pid, cam, path) in enumerate(feature_bar, 1):
             images = images.to(device, non_blocking=True)
             _, bn_feat, _ = model(images)
             norm_feat = F.normalize(bn_feat, dim=1)
@@ -76,6 +104,11 @@ def extract_features(model: ReIDBaseline, loader: DataLoader, device: torch.devi
             pids.extend(int(x) for x in pid)
             camids.extend(int(x) for x in cam)
             paths.extend(path)
+            processed += images.size(0)
+
+            if idx % refresh == 0 and hasattr(feature_bar, "set_postfix"):
+                elapsed = max(time.time() - start_time, 1e-6)
+                feature_bar.set_postfix({"img/s": f"{processed / elapsed:.1f}"})
 
     features = torch.cat(feats, dim=0) if feats else torch.empty(0, device="cpu")
     return features, pids, camids, paths
@@ -123,6 +156,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--device", type=str, default=None, help="Computation device (e.g., cuda, cpu)")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--no_progress", action="store_true", help="禁用进度条")
+    parser.add_argument("--force_progress", action="store_true", help="即使非TTY也显示进度条")
+    parser.add_argument("--progress_ascii", action="store_true", help="用ASCII渲染进度条（Windows/日志更稳）")
+    parser.add_argument(
+        "--progress_refresh",
+        type=int,
+        default=10,
+        help="batch 间隔多少步刷新一次后缀信息",
+    )
     return parser.parse_args(argv)
 
 
@@ -162,17 +205,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     gallery_dataset = ImageListDataset(gallery_paths, transform)
     query_dataset = ImageListDataset(query_paths, transform)
 
-    gallery_loader = DataLoader(gallery_dataset, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
-    query_loader = DataLoader(query_dataset, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
+    gallery_loader = DataLoader(
+        gallery_dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    query_loader = DataLoader(
+        query_dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
-    gallery_feats, gallery_pids, gallery_camids, gallery_strs = extract_features(model, gallery_loader, device)
-    query_feats, query_pids, query_camids, query_strs = extract_features(model, query_loader, device)
+    if args.num_workers > 0 and os.name == "nt":
+        progress_write("Hint: Windows 下如遇 DataLoader 卡顿，可尝试 --num_workers 0")
+
+    progress_write("Warming up dataloaders ...")
+    for name, loader in (("gallery", gallery_loader), ("query", query_loader)):
+        try:
+            iterator = iter(loader)
+            next(iterator)
+            progress_write(f"{name.capitalize()} loader ready.")
+        except StopIteration:
+            progress_write(f"{name.capitalize()} loader is empty.")
+        except Exception as exc:  # pragma: no cover - dataloader backend issues
+            progress_write(f"Failed to warm up {name} loader: {exc}")
+    progress_write("Dataloaders ready.")
+
+    gallery_feats, gallery_pids, gallery_camids, gallery_strs = extract_features(
+        model,
+        gallery_loader,
+        device,
+        args=args,
+        desc="Extract[gallery]",
+        position=0,
+    )
+    query_feats, query_pids, query_camids, query_strs = extract_features(
+        model,
+        query_loader,
+        device,
+        args=args,
+        desc="Extract[query]",
+        position=0,
+    )
 
     if gallery_feats.numel() == 0 or query_feats.numel() == 0:
         raise RuntimeError("No features extracted. Please ensure the dataset folders contain images.")
 
     distmat = cosine_distance_matrix(query_feats, gallery_feats)
-    map_score, cmc_dict = market1501_metrics(distmat, query_pids, gallery_pids, query_camids, gallery_camids)
+    map_score, cmc_dict = market1501_metrics(
+        distmat,
+        query_pids,
+        gallery_pids,
+        query_camids,
+        gallery_camids,
+        progress_args=args,
+        progress_position=1,
+    )
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     (args.outdir / "results.json").write_text(
@@ -191,11 +283,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         topk=10,
     )
 
-    print("Evaluation complete")
-    print(f"mAP: {map_score:.4f}")
-    print("CMC:")
+    progress_write("Evaluation complete")
+    progress_write(f"mAP: {map_score:.4f}")
+    progress_write("CMC:")
     for rank in sorted(cmc_dict):
-        print(f"  Rank-{rank}: {cmc_dict[rank]:.4f}")
+        progress_write(f"  Rank-{rank}: {cmc_dict[rank]:.4f}")
 
     return 0
 
