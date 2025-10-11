@@ -249,6 +249,10 @@ For DukeMTMC-reID and MSMT17, reuse the same commands with adjusted `--data_root
 - **Text search weak:** Confirm captions exist (`outputs/captions/*.csv`), regenerate them with richer prompts, and re-run retrieval.
 - **PWS says “no deploy”:** Inspect `decision_matrix.csv`, lower `--complexity`, reduce SLA breaches, or cut per-query token/GPU costs.
 
+## Experiments
+
+- [EXP-2025-10-11 — Prompt Improvements for Text→Person Retrieval](experiments/EXP-2025-10-11-prompt-improvements.md)
+
 ## 14. License & Citation
 
 A standalone license file is not included; treat the code as “all rights reserved” unless you obtain explicit permission from the maintainers.
