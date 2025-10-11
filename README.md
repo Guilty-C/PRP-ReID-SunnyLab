@@ -46,6 +46,76 @@ pip install -r requirements.txt
 
 Tested on Python 3.10.13, PyTorch 2.1.0+cu121, CUDA 12.1 with an RTX 4060. Set `DATA_DIR` (e.g., `export DATA_DIR=$(pwd)/datasets`) or pass `--data_root` flags so scripts can locate datasets.
 
+## Clean → Train → Eval (Market-1501)
+
+Use the washed Market-1501 training images for supervised learning, then evaluate on the official test split (`query/` + `bounding_box_test/`). Paths with spaces should stay wrapped in quotes. Windows PowerShell/CMD use backslashes, while Git Bash requires escaping them (e.g., `D:\\PRP SunnyLab\\...`).
+
+### 1. Export manifest & splits (washed train set)
+
+PowerShell / CMD:
+
+```powershell
+python tools/market1501_wash/export_manifest.py `
+  --root "D:\PRP SunnyLab\reid-prompt\data\market1501_clean" `
+  --out_csv "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\train_manifest.csv" `
+  --out_splits "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\splits.json" `
+  --val_ratio 0.1 --seed 42
+```
+
+Git Bash:
+
+```bash
+python tools/market1501_wash/export_manifest.py \
+  --root "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean" \
+  --out_csv "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\train_manifest.csv" \
+  --out_splits "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\splits.json" \
+  --val_ratio 0.1 --seed 42
+```
+
+### 2. Train the supervised baseline (washed train set)
+
+PowerShell / CMD:
+
+```powershell
+python src/train_reid_baseline.py `
+  --clean_root "D:\PRP SunnyLab\reid-prompt\data\market1501_clean" `
+  --manifest  "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\train_manifest.csv" `
+  --splits    "D:\PRP SunnyLab\reid-prompt\data\market1501_clean\splits.json" `
+  --outdir    "D:\PRP SunnyLab\reid-prompt\outputs\market1501_clean_baseline" `
+  --epochs 120 --batch 64 --height 256 --width 128 --lr 3.5e-4 --seed 42
+```
+
+Git Bash:
+
+```bash
+python src/train_reid_baseline.py \
+  --clean_root "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean" \
+  --manifest  "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\train_manifest.csv" \
+  --splits    "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501_clean\\splits.json" \
+  --outdir    "D:\\PRP SunnyLab\\reid-prompt\\outputs\\market1501_clean_baseline" \
+  --epochs 120 --batch 64 --height 256 --width 128 --lr 3.5e-4 --seed 42
+```
+
+### 3. Evaluate on the official Market-1501 test split (original query/test folders)
+
+PowerShell / CMD:
+
+```powershell
+python src/extract_and_eval_market1501.py `
+  --ckpt "D:\PRP SunnyLab\reid-prompt\outputs\market1501_clean_baseline\best.pth" `
+  --test_root "D:\PRP SunnyLab\reid-prompt\data\market1501" `
+  --outdir "D:\PRP SunnyLab\reid-prompt\outputs\market1501_clean_baseline\eval"
+```
+
+Git Bash:
+
+```bash
+python src/extract_and_eval_market1501.py \
+  --ckpt "D:\\PRP SunnyLab\\reid-prompt\\outputs\\market1501_clean_baseline\\best.pth" \
+  --test_root "D:\\PRP SunnyLab\\reid-prompt\\data\\market1501" \
+  --outdir "D:\\PRP SunnyLab\\reid-prompt\\outputs\\market1501_clean_baseline\\eval"
+```
+
 ## 2. Dataset Layouts
 
 All scripts assume Market-1501-style folders and can be adapted via `--data_root` arguments. Recommended structure:
