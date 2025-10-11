@@ -18,6 +18,9 @@
 - [13. Troubleshooting](#13-troubleshooting)
 - [14. License & Citation](#14-license--citation)
 
+## Documentation
+- [Project Process](PROCESS.md)
+
 ## 1. Quickstart (TL;DR)
 
 ```bash
