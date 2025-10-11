@@ -1,115 +1,171 @@
-"""Export manifest and train/val splits for cleaned Market-1501 data."""
-
+"""Export manifests for washed Market-1501 data."""
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import logging
+import os
 import random
 import re
-import sys
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Tuple
 
-
-MARKET_RE = re.compile(
+_PATTERN = re.compile(
     r"^(?P<pid>-?\d{1,5})_c(?P<cam>\d)s(?P<seq>\d)_(?P<frame>\d{3,7})_(?P<idx>\d{2})\.(?:jpg|jpeg|png)$",
     re.IGNORECASE,
 )
 
-
-def parse_market_name(path: Path):
-    match = MARKET_RE.fullmatch(path.name)
-    if not match:
-        return None
-    groups = match.groupdict()
-    return {k: int(groups[k]) for k in ("pid", "cam", "seq", "frame", "idx")}
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png"}
 
 
-def iter_images(root: Path) -> Iterable[Path]:
-    exts = {".jpg", ".jpeg", ".png"}
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() in exts:
-            yield path
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Export manifest CSV for washed Market-1501 data")
+    parser.add_argument(
+        "root",
+        type=Path,
+        help="Root directory containing the cleaned Market-1501 images",
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=Path,
+        default=None,
+        help="Destination CSV path (default: <root>/train_manifest.csv)",
+    )
+    parser.add_argument(
+        "--splits_json",
+        type=Path,
+        default=None,
+        help="Destination JSON path for ID splits (default: <root>/splits.json)",
+    )
+    parser.add_argument(
+        "--relative",
+        action="store_true",
+        help="Store paths relative to the root directory",
+    )
+    parser.add_argument(
+        "--posix_paths",
+        action="store_true",
+        help="Use POSIX style (forward slash) paths in the manifest",
+    )
+    parser.add_argument(
+        "--val_ratio",
+        type=float,
+        default=0.1,
+        help="Ratio of person IDs to reserve for validation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for the train/val split (default: 42)",
+    )
+    return parser.parse_args()
 
 
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export Market-1501 cleaned manifest and splits")
-    parser.add_argument("--root", required=True, type=Path, help="Path to cleaned Market-1501 root")
-    parser.add_argument("--out_csv", required=True, type=Path, help="Path to output manifest CSV")
-    parser.add_argument("--out_splits", required=True, type=Path, help="Path to output splits JSON")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio by identity")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling IDs")
-    return parser
+def iter_image_paths(root: Path) -> Iterable[Path]:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            suffix = Path(name).suffix.lower()
+            if suffix in SUPPORTED_EXTS:
+                yield Path(dirpath) / name
 
 
-def write_manifest(rows: Sequence[dict], out_csv: Path) -> None:
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["path", "pid", "cam", "seq", "frame", "idx"])
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def format_path(path: Path, root: Path, use_relative: bool, use_posix: bool) -> str:
+    final_path = path
+    if use_relative:
+        final_path = path.relative_to(root)
+    if use_posix:
+        return final_path.as_posix()
+    return str(final_path)
 
 
-def split_ids(ids: Sequence[int], val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
-    ids_list = list(ids)
-    rng = random.Random(seed)
-    rng.shuffle(ids_list)
-    if not ids_list:
+def build_rows(
+    root: Path,
+    use_relative: bool,
+    use_posix: bool,
+) -> Tuple[List[List[str]], int, List[int]]:
+    rows: List[List[str]] = []
+    bad_names = 0
+    pids: List[int] = []
+    for path in iter_image_paths(root):
+        match = _PATTERN.match(path.name)
+        if not match:
+            bad_names += 1
+            continue
+        pid = int(match.group("pid"))
+        cam = int(match.group("cam"))
+        seq = int(match.group("seq"))
+        frame = int(match.group("frame"))
+        idx = int(match.group("idx"))
+
+        path_str = format_path(path, root, use_relative, use_posix)
+        rows.append([path_str, str(pid), str(cam), str(seq), str(frame), str(idx)])
+        pids.append(pid)
+    return rows, bad_names, pids
+
+
+def write_manifest(csv_path: Path, rows: List[List[str]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["path", "pid", "cam", "seq", "frame", "idx"])
+        writer.writerows(rows)
+
+
+def build_splits(pids: Iterable[int], val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
+    unique_ids = sorted({pid for pid in pids if pid != -1})
+    if not unique_ids:
         return [], []
-
-    val_count = int(round(len(ids_list) * val_ratio)) if val_ratio > 0 else 0
+    if not (0.0 <= val_ratio <= 1.0):
+        raise ValueError("--val_ratio must be between 0 and 1")
+    rng = random.Random(seed)
+    rng.shuffle(unique_ids)
+    val_count = int(round(len(unique_ids) * val_ratio))
     if val_ratio > 0 and val_count == 0:
         val_count = 1
-    if val_count >= len(ids_list):
-        val_count = max(len(ids_list) - 1, 0)
-    train_ids = ids_list[:-val_count] if val_count else ids_list
-    val_ids = ids_list[-val_count:] if val_count else []
+    val_ids = sorted(unique_ids[:val_count])
+    train_ids = sorted(unique_ids[val_count:])
     return train_ids, val_ids
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_argparser()
-    args = parser.parse_args(argv)
+def write_splits(json_path: Path, train_ids: List[int], val_ids: List[int]) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "train_ids": train_ids,
+        "val_ids": val_ids,
+    }
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-    root = args.root.expanduser().resolve()
-    if not root.exists():
-        parser.error(f"Root directory does not exist: {root}")
 
-    records: List[dict] = []
-    for img_path in iter_images(root):
-        parsed = parse_market_name(img_path)
-        if not parsed:
-            continue
-        try:
-            rel_path = img_path.relative_to(root)
-            rel_str = rel_path.as_posix()
-        except ValueError:
-            rel_str = img_path.as_posix()
-        records.append({"path": rel_str, **parsed})
+def main() -> None:
+    args = parse_args()
+    root = args.root.resolve()
+    if not root.is_dir():
+        raise SystemExit(f"Root directory not found: {root}")
+    csv_path = (args.output_csv or (root / "train_manifest.csv")).resolve()
+    splits_path = (args.splits_json or (root / "splits.json")).resolve()
 
-    records.sort(key=lambda r: (r["pid"], r["cam"], r["seq"], r["frame"], r["idx"]))
+    rows, bad_names, pids = build_rows(root, args.relative, args.posix_paths)
+    rows.sort(key=lambda row: row[0])
+    write_manifest(csv_path, rows)
 
-    write_manifest(records, args.out_csv.expanduser())
+    train_ids, val_ids = build_splits(pids, args.val_ratio, args.seed)
+    write_splits(splits_path, train_ids, val_ids)
 
-    unique_ids = sorted({r["pid"] for r in records if r["pid"] != -1})
-    train_ids, val_ids = split_ids(unique_ids, args.val_ratio, args.seed)
-
-    splits = {"train_ids": train_ids, "val_ids": val_ids}
-    out_splits = args.out_splits.expanduser()
-    out_splits.parent.mkdir(parents=True, exist_ok=True)
-    out_splits.write_text(json.dumps(splits, indent=2), encoding="utf-8")
-
-    total_images = len(records)
-    total_ids = len(unique_ids)
-    print(f"Indexed {total_images} images under {root}")
-    print(f"Unique IDs (excluding -1): {total_ids}")
-    print(f"Train IDs: {len(train_ids)} | Val IDs: {len(val_ids)}")
-    print(f"Manifest written to: {args.out_csv}")
-    print(f"Splits written to: {args.out_splits}")
-    return 0
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.info("manifest: %s rows=%d bad_names_skipped=%d", csv_path, len(rows), bad_names)
+    logging.info(
+        "splits: %s train_ids=%d val_ids=%d seed=%d val_ratio=%s",
+        splits_path,
+        len(train_ids),
+        len(val_ids),
+        args.seed,
+        args.val_ratio,
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
