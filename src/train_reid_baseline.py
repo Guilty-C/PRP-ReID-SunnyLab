@@ -23,6 +23,22 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torchvision.models import ResNet50_Weights, resnet50
 
+
+def pick_device(dev_arg: str) -> torch.device:
+    dev_arg = (dev_arg or "auto").lower()
+    if dev_arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if dev_arg.startswith("cuda"):
+        return torch.device(dev_arg if torch.cuda.is_available() else "cpu")
+    if dev_arg == "mps":
+        has_mps = getattr(torch.backends, "mps", None)
+        return torch.device("mps" if has_mps and torch.backends.mps.is_available() else "cpu")
+    return torch.device("cpu")
+
 try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - fallback when tqdm missing
@@ -256,6 +272,8 @@ def build_dataloaders(
     pk_k: int,
     seed: int,
     num_workers: int,
+    *,
+    device: torch.device,
 ) -> Tuple[DataLoader, DataLoader, Dict[int, int]]:
     train_transform = build_market1501_transforms(height=height, width=width, is_train=True)
     val_transform = build_market1501_transforms(height=height, width=width, is_train=False)
@@ -278,18 +296,23 @@ def build_dataloaders(
     pid_to_label = {pid: idx for idx, pid in enumerate(sorted(set(train_ids)))}
 
     train_sampler = PKSampler(train_dataset.labels, P=pk_p, K=pk_k, seed=seed)
+    pin_memory = device.type == "cuda"
+    persistent_workers = num_workers > 0
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     return train_loader, val_loader, pid_to_label
 
@@ -305,6 +328,9 @@ def extract_features(
     ce_criterion: nn.Module | None = None,
     triplet_margin: float | None = None,
     pid_to_label: Dict[int, int] | None = None,
+    use_amp: bool = False,
+    autocast_dtype: torch.dtype | None = None,
+    channels_last: bool = False,
 ) -> Tuple[torch.Tensor, List[int], List[int], List[str], TrainStats | None]:
     model.eval()
     feats: List[torch.Tensor] = []
@@ -324,11 +350,20 @@ def extract_features(
 
     feature_bar = make_tqdm(loader, _args=args, **tqdm_kwargs)
 
+    autocast_kwargs = {
+        "device_type": device.type,
+        "enabled": use_amp,
+        "dtype": autocast_dtype,
+    }
+
     with torch.no_grad():
         for idx, (images, pid, cam, path) in enumerate(feature_bar, 1):
             images = images.to(device, non_blocking=True)
-            pid_dev = pid.to(device)
-            global_feat, bn_feat, logits = model(images)
+            if channels_last and device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
+            pid_dev = pid.to(device, non_blocking=True)
+            with torch.amp.autocast(**autocast_kwargs):
+                global_feat, bn_feat, logits = model(images)
             norm_feat = F.normalize(bn_feat, dim=1)
             feats.append(norm_feat.cpu())
             pids.extend(int(x) for x in pid)
@@ -343,7 +378,7 @@ def extract_features(
                     if pid_to_label
                     else [int(x) for x in pid.tolist()]
                 )
-                targets = torch.tensor(labels, device=device)
+                targets = torch.as_tensor(labels, device=device)
                 ce_loss = ce_criterion(logits, targets)
                 tri_loss = hard_triplet_loss(triplet_feat, pid_dev, margin=triplet_margin)
                 total_loss = ce_loss + tri_loss
@@ -379,6 +414,9 @@ def evaluate_split(
     ce_criterion: nn.Module,
     triplet_margin: float,
     pid_to_label: Dict[int, int] | None = None,
+    use_amp: bool = False,
+    autocast_dtype: torch.dtype | None = None,
+    channels_last: bool = False,
 ) -> Tuple[float, Dict[int, float], TrainStats | None]:
     progress_write("INFO eval: using raw PIDs (no mapping).")
     feats, pids, camids, _, stats = extract_features(
@@ -391,6 +429,9 @@ def evaluate_split(
         ce_criterion=ce_criterion,
         triplet_margin=triplet_margin,
         pid_to_label=None,
+        use_amp=use_amp,
+        autocast_dtype=autocast_dtype,
+        channels_last=channels_last,
     )
     if feats.numel() == 0:
         return 0.0, {1: 0.0, 5: 0.0, 10: 0.0}, stats
@@ -430,7 +471,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: AdamW,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.amp.GradScaler | None,
     device: torch.device,
     ce_criterion: nn.Module,
     triplet_margin: float,
@@ -439,6 +480,10 @@ def train_epoch(
     epoch: int,
     *,
     args: argparse.Namespace,
+    use_amp: bool,
+    autocast_dtype: torch.dtype | None,
+    grad_accum_steps: int,
+    channels_last: bool,
 ) -> TrainStats:
     model.train()
     stats = TrainStats()
@@ -446,7 +491,7 @@ def train_epoch(
     start_time = time.time()
     processed = 0
     loader_len = len(loader)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         try:
             torch.cuda.reset_peak_memory_stats(device)
         except Exception:  # pragma: no cover - CPU or unsupported devices
@@ -460,35 +505,65 @@ def train_epoch(
         _args=args,
     )
 
-    _autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    optimizer.zero_grad(set_to_none=True)
 
     for iteration, (images, pids, _camids, _paths) in enumerate(train_bar, 1):
-        images = images.to(device, non_blocking=True)
-        pids = pids.to(device)
-        targets = torch.tensor([pid_to_label[int(pid)] for pid in pids.tolist()], device=device)
+        batch_size = images.size(0)
+        try:
+            images = images.to(device, non_blocking=True)
+            if channels_last and device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
+            pids = pids.to(device, non_blocking=True)
+            pid_list = pids.detach().cpu().tolist()
+            targets = torch.as_tensor(
+                [pid_to_label[int(pid)] for pid in pid_list], device=device
+            )
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(_autocast_device, enabled=scaler.is_enabled()):
-            global_feat, bn_feat, logits = model(images)
-            norm_feat = F.normalize(global_feat, dim=1)
-            ce_loss = ce_criterion(logits, targets)
-            tri_loss = hard_triplet_loss(norm_feat, pids, margin=triplet_margin)
-            loss = ce_loss + tri_loss
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=use_amp,
+                dtype=autocast_dtype,
+            ):
+                global_feat, bn_feat, logits = model(images)
+                norm_feat = F.normalize(global_feat, dim=1)
+                ce_loss = ce_criterion(logits, targets)
+                tri_loss = hard_triplet_loss(norm_feat, pids, margin=triplet_margin)
+                total_loss = ce_loss + tri_loss
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+            loss = total_loss / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-        with torch.no_grad():
-            stats.loss += loss.item() * images.size(0)
-            stats.ce_loss += ce_loss.item() * images.size(0)
-            stats.triplet_loss += tri_loss.item() * images.size(0)
-            preds = logits.argmax(dim=1)
-            stats.acc += (preds == targets).float().sum().item()
-            stats.count += images.size(0)
-            processed += images.size(0)
+            should_step = (iteration % grad_accum_steps == 0) or (iteration == loader_len)
+            if should_step:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                stats.loss += total_loss.item() * batch_size
+                stats.ce_loss += ce_loss.item() * batch_size
+                stats.triplet_loss += tri_loss.item() * batch_size
+                preds = logits.argmax(dim=1)
+                stats.acc += (preds == targets).float().sum().item()
+                stats.count += batch_size
+                processed += batch_size
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            progress_write(
+                "WARN: CUDA OOM; consider reducing batch size or increase --grad_accum_steps"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         if iteration % refresh == 0:
             avg_loss = stats.loss / max(1, stats.count)
@@ -507,7 +582,7 @@ def train_epoch(
                     "lr": f"{lr:.2e}",
                     "img/s": f"{imgs_per_s:.1f}",
                 }
-                if torch.cuda.is_available():
+                if device.type == "cuda":
                     try:
                         mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
                         postfix["mem"] = f"{mem:.0f}MB"
@@ -560,6 +635,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=10,
         help="batch 间隔多少步刷新一次后缀信息",
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto|cuda|cuda:0|mps|cpu (default: auto detects CUDA/MPS)",
+    )
+    parser.add_argument(
+        "--precision",
+        default="amp",
+        choices=["amp", "fp32", "bf16"],
+        help="Training precision (default: amp)",
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--channels_last",
+        action="store_true",
+        help="Use channels_last memory format on GPU",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model if supported",
+    )
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for finetune/resume")
     parser.add_argument(
         "--resume_strict",
@@ -602,7 +704,72 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_arg = args.device or "auto"
+    device = pick_device(device_arg)
+    print(
+        f"INFO torch: {torch.__version__} | cuda_available: {torch.cuda.is_available()} | torch.cuda: {getattr(torch.version, 'cuda', None)}"
+    )
+    print(f"INFO device: {device}")
+    if device.type == "cuda":
+        try:
+            print(f"INFO cuda: {torch.cuda.get_device_name(device)}")
+        except Exception:
+            print("INFO cuda: <unknown device>")
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    elif device_arg.lower().startswith("cuda") and not torch.cuda.is_available():
+        print("ERROR: CUDA requested but not available.", file=sys.stderr)
+        print(
+            "Hint: Install a CUDA-enabled PyTorch build, e.g.:",
+            file=sys.stderr,
+        )
+        print(
+            "  pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision",
+            file=sys.stderr,
+        )
+        print(
+            "Also verify NVIDIA driver + CUDA toolkit compatible with your PyTorch build.",
+            file=sys.stderr,
+        )
+        return 2
+
+    grad_accum_steps = max(1, args.grad_accum_steps)
+    if grad_accum_steps != args.grad_accum_steps:
+        progress_write("INFO: --grad_accum_steps < 1. Using 1 instead.")
+
+    precision_mode = args.precision
+    autocast_dtype: torch.dtype | None = None
+    use_amp = False
+    if precision_mode == "amp":
+        use_amp = device.type in ("cuda", "mps")
+    elif precision_mode == "bf16":
+        if device.type == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            autocast_dtype = torch.bfloat16
+            use_amp = True
+        else:
+            progress_write("WARN: bf16 requested but not supported. Falling back to fp32.")
+            precision_mode = "fp32"
+    else:
+        use_amp = False
+
+    if device.type == "mps" and precision_mode == "amp":
+        progress_write("INFO: Using MPS autocast mixed precision.")
+    elif precision_mode == "amp" and not use_amp:
+        progress_write("WARN: AMP requested but not supported on selected device. Using fp32.")
+
+    scaler: torch.amp.GradScaler | None = None
+    if precision_mode == "amp" and device.type == "cuda" and use_amp:
+        try:
+            scaler = torch.amp.GradScaler(device.type)
+        except Exception:
+            scaler = torch.amp.GradScaler("cuda")
+    else:
+        scaler = None
 
     train_loader, val_loader, pid_to_label = build_dataloaders(
         clean_root=args.clean_root,
@@ -616,6 +783,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pk_k=args.pk_k,
         seed=args.seed,
         num_workers=args.num_workers,
+        device=device,
     )
 
     if args.num_workers > 0 and os.name == "nt":
@@ -635,6 +803,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     model = ReIDBaseline(num_classes=len(pid_to_label))
     model.to(device)
+    if args.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            progress_write("INFO: model compiled with torch.compile")
+        except Exception as exc:
+            progress_write(f"WARN: torch.compile failed -> {exc}")
 
     resume_ckpt: Dict[str, Any] | None = None
     start_epoch = 0
@@ -650,7 +826,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, epochs=args.epochs, warmup_epochs=10)
-    scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu")
 
     if resume_ckpt is not None:
         opt_state = resume_ckpt.get("optimizer")
@@ -668,12 +843,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception as exc:  # pragma: no cover - state mismatch
                 progress_write(f"WARN resume: scheduler state not loaded: {exc}")
         scaler_state = resume_ckpt.get("scaler")
-        if scaler_state is not None:
+        if scaler_state is not None and scaler is not None:
             try:
                 scaler.load_state_dict(scaler_state)
                 progress_write("INFO resume: scaler state loaded")
             except Exception as exc:  # pragma: no cover - scaler mismatch
                 progress_write(f"WARN resume: scaler state not loaded: {exc}")
+        elif scaler_state is not None and scaler is None:
+            progress_write("WARN resume: scaler state present but AMP disabled; skipping load")
 
     ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     triplet_margin = 0.3
@@ -728,6 +905,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_freq=args.print_freq,
             epoch=epoch,
             args=args,
+            use_amp=use_amp,
+            autocast_dtype=autocast_dtype,
+            grad_accum_steps=grad_accum_steps,
+            channels_last=args.channels_last,
         )
 
         val_map, val_cmc, val_stats = evaluate_split(
@@ -738,6 +919,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ce_criterion=ce_criterion,
             triplet_margin=triplet_margin,
             pid_to_label=None,
+            use_amp=use_amp,
+            autocast_dtype=autocast_dtype,
+            channels_last=args.channels_last,
         )
         scheduler.step()
 
@@ -766,7 +950,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "num_classes": len(pid_to_label),
             "pid_to_label": pid_to_label,
             "val_map": val_map,

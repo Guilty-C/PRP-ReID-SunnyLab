@@ -7,6 +7,7 @@ import csv
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import List, Sequence
@@ -22,6 +23,7 @@ from train_reid_baseline import (
     cosine_distance_matrix,
     make_tqdm,
     market1501_metrics,
+    pick_device,
     progress_write,
 )
 
@@ -76,6 +78,9 @@ def extract_features(
     args: argparse.Namespace,
     desc: str,
     position: int,
+    use_amp: bool,
+    autocast_dtype: torch.dtype | None,
+    channels_last: bool,
 ):
     feats: List[torch.Tensor] = []
     pids: List[int] = []
@@ -95,10 +100,19 @@ def extract_features(
         _args=args,
     )
 
+    autocast_kwargs = {
+        "device_type": device.type,
+        "enabled": use_amp,
+        "dtype": autocast_dtype,
+    }
+
     with torch.no_grad():
         for idx, (images, pid, cam, path) in enumerate(feature_bar, 1):
             images = images.to(device, non_blocking=True)
-            _, bn_feat, _ = model(images)
+            if channels_last and device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
+            with torch.amp.autocast(**autocast_kwargs):
+                _, bn_feat, _ = model(images)
             norm_feat = F.normalize(bn_feat, dim=1)
             feats.append(norm_feat.cpu())
             pids.extend(int(x) for x in pid)
@@ -155,7 +169,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--device", type=str, default=None, help="Computation device (e.g., cuda, cpu)")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto|cuda|cuda:0|mps|cpu (default: auto detects CUDA/MPS)",
+    )
+    parser.add_argument(
+        "--precision",
+        default="amp",
+        choices=["amp", "fp32", "bf16"],
+        help="Training precision (default: amp)",
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--channels_last",
+        action="store_true",
+        help="Use channels_last memory format on GPU",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model if supported",
+    )
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--no_progress", action="store_true", help="禁用进度条")
     parser.add_argument("--force_progress", action="store_true", help="即使非TTY也显示进度条")
@@ -181,7 +221,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.test_root.exists():
         raise FileNotFoundError(f"Test root not found: {args.test_root}")
 
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_arg = args.device or "auto"
+    device = pick_device(device_arg)
+    print(
+        f"INFO torch: {torch.__version__} | cuda_available: {torch.cuda.is_available()} | torch.cuda: {getattr(torch.version, 'cuda', None)}"
+    )
+    print(f"INFO device: {device}")
+    if device.type == "cuda":
+        try:
+            print(f"INFO cuda: {torch.cuda.get_device_name(device)}")
+        except Exception:
+            print("INFO cuda: <unknown device>")
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    elif device_arg.lower().startswith("cuda") and not torch.cuda.is_available():
+        print("ERROR: CUDA requested but not available.", file=sys.stderr)
+        print("Hint: Install a CUDA-enabled PyTorch build, e.g.:", file=sys.stderr)
+        print(
+            "  pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision",
+            file=sys.stderr,
+        )
+        print(
+            "Also verify NVIDIA driver + CUDA toolkit compatible with your PyTorch build.",
+            file=sys.stderr,
+        )
+        return 2
+
+    precision_mode = args.precision
+    autocast_dtype: torch.dtype | None = None
+    use_amp = False
+    if precision_mode == "amp":
+        use_amp = device.type in ("cuda", "mps")
+    elif precision_mode == "bf16":
+        if device.type == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            autocast_dtype = torch.bfloat16
+            use_amp = True
+        else:
+            progress_write("WARN: bf16 requested but not supported. Falling back to fp32.")
+            precision_mode = "fp32"
+    else:
+        use_amp = False
+
+    if device.type == "mps" and precision_mode == "amp":
+        progress_write("INFO: Using MPS autocast mixed precision.")
+    elif precision_mode == "amp" and not use_amp:
+        progress_write("WARN: AMP requested but not supported on selected device. Using fp32.")
+
+    if args.grad_accum_steps > 1:
+        progress_write("INFO: --grad_accum_steps has no effect during evaluation")
 
     checkpoint = torch.load(args.ckpt, map_location=device)
     num_classes = int(checkpoint.get("num_classes", 0))
@@ -191,6 +283,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = ReIDBaseline(num_classes=num_classes)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
+    if args.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            progress_write("INFO: model compiled with torch.compile")
+        except Exception as exc:
+            progress_write(f"WARN: torch.compile failed -> {exc}")
 
     transform = build_market1501_transforms(height=args.height, width=args.width, is_train=False)
 
@@ -205,19 +305,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     gallery_dataset = ImageListDataset(gallery_paths, transform)
     query_dataset = ImageListDataset(query_paths, transform)
 
+    pin_memory = device.type == "cuda"
+    persistent_workers = args.num_workers > 0
+    loader_kwargs = {
+        "batch_size": args.batch,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
     gallery_loader = DataLoader(
         gallery_dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     query_loader = DataLoader(
         query_dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     if args.num_workers > 0 and os.name == "nt":
@@ -242,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args=args,
         desc="Extract[gallery]",
         position=0,
+        use_amp=use_amp,
+        autocast_dtype=autocast_dtype,
+        channels_last=args.channels_last,
     )
     query_feats, query_pids, query_camids, query_strs = extract_features(
         model,
@@ -250,6 +356,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args=args,
         desc="Extract[query]",
         position=0,
+        use_amp=use_amp,
+        autocast_dtype=autocast_dtype,
+        channels_last=args.channels_last,
     )
 
     if gallery_feats.numel() == 0 or query_feats.numel() == 0:
