@@ -9,9 +9,10 @@ import os
 import random
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +71,66 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _strip_module_prefix(sd: Dict[str, torch.Tensor]) -> "OrderedDict[str, torch.Tensor]":
+    out: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    for key, value in sd.items():
+        if key.startswith("module."):
+            out[key[len("module."):]] = value
+        else:
+            out[key] = value
+    return out
+
+
+def load_checkpoint_finetune(
+    model: nn.Module,
+    ckpt_path: os.PathLike[str] | str,
+    *,
+    strict: bool = False,
+    skip_keys_prefix: Tuple[str, ...] = ("classifier.", "bnneck."),
+) -> Dict[str, Any]:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported checkpoint format from {ckpt_path!r}")
+    state_dict = _strip_module_prefix(state_dict)
+
+    model_sd = model.state_dict()
+    loadable: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    skipped: List[Tuple[str, str]] = []
+    for key, value in state_dict.items():
+        if any(key.startswith(prefix) for prefix in skip_keys_prefix):
+            skipped.append((key, "prefix-skip"))
+            continue
+        if key in model_sd and model_sd[key].shape == value.shape:
+            loadable[key] = value
+        else:
+            target_tensor = model_sd.get(key)
+            target_shape = tuple(target_tensor.shape) if target_tensor is not None else ()
+            skipped.append((key, f"shape {tuple(value.shape)} != {target_shape}"))
+
+    progress_write(
+        f"INFO resume: Loaded {len(loadable)}/{len(model_sd)} params from {ckpt_path}."
+    )
+    if skipped:
+        preview = [f"{k} ({reason})" for k, reason in skipped[:8]]
+        more = " ..." if len(skipped) > 8 else ""
+        progress_write(f"INFO resume: skipped keys = {preview}{more}")
+
+    if strict:
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        model.load_state_dict(loadable, strict=False)
+
+    return ckpt if isinstance(ckpt, dict) else {"state_dict": ckpt}
+
+
+def set_backbone_requires_grad(model: nn.Module, requires_grad: bool) -> None:
+    for name, param in model.named_parameters():
+        if name.startswith("classifier.") or name.startswith("bnneck."):
+            continue
+        param.requires_grad = requires_grad
 
 
 class ReIDBaseline(nn.Module):
@@ -499,6 +560,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=10,
         help="batch 间隔多少步刷新一次后缀信息",
     )
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for finetune/resume")
+    parser.add_argument(
+        "--resume_strict",
+        action="store_true",
+        help="Strict load all layers (default: non-strict)",
+    )
+    parser.add_argument(
+        "--freeze_backbone_epochs",
+        type=int,
+        default=0,
+        help="Freeze backbone for first N epochs",
+    )
     return parser.parse_args(argv)
 
 
@@ -509,6 +582,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.manifest = args.manifest.expanduser().resolve()
     args.splits = args.splits.expanduser().resolve()
     args.outdir = args.outdir.expanduser().resolve()
+    if args.resume:
+        args.resume = Path(args.resume).expanduser().resolve()
 
     if args.batch != args.pk_p * args.pk_k:
         progress_write(
@@ -561,24 +636,82 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = ReIDBaseline(num_classes=len(pid_to_label))
     model.to(device)
 
+    resume_ckpt: Dict[str, Any] | None = None
+    start_epoch = 0
+    if args.resume:
+        resume_ckpt = load_checkpoint_finetune(
+            model,
+            args.resume,
+            strict=args.resume_strict,
+            skip_keys_prefix=("classifier.", "bnneck."),
+        )
+        start_epoch = int(resume_ckpt.get("epoch", 0))
+        progress_write(f"INFO resume: starting from epoch {start_epoch}")
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, epochs=args.epochs, warmup_epochs=10)
     scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu")
+
+    if resume_ckpt is not None:
+        opt_state = resume_ckpt.get("optimizer")
+        if opt_state is not None:
+            try:
+                optimizer.load_state_dict(opt_state)
+                progress_write("INFO resume: optimizer state loaded")
+            except Exception as exc:  # pragma: no cover - state mismatch
+                progress_write(f"WARN resume: optimizer state not loaded: {exc}")
+        sch_state = resume_ckpt.get("scheduler")
+        if sch_state is not None and scheduler is not None:
+            try:
+                scheduler.load_state_dict(sch_state)
+                progress_write("INFO resume: scheduler state loaded")
+            except Exception as exc:  # pragma: no cover - state mismatch
+                progress_write(f"WARN resume: scheduler state not loaded: {exc}")
+        scaler_state = resume_ckpt.get("scaler")
+        if scaler_state is not None:
+            try:
+                scaler.load_state_dict(scaler_state)
+                progress_write("INFO resume: scaler state loaded")
+            except Exception as exc:  # pragma: no cover - scaler mismatch
+                progress_write(f"WARN resume: scaler state not loaded: {exc}")
+
     ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     triplet_margin = 0.3
 
-    best_map = -1.0
-    best_epoch = -1
+    if resume_ckpt is not None:
+        best_map = float(resume_ckpt.get("val_map", -1.0))
+        best_epoch = int(resume_ckpt.get("best_epoch", resume_ckpt.get("epoch", -1)))
+    else:
+        best_map = -1.0
+        best_epoch = -1
 
+    epoch_iter = range(start_epoch + 1, args.epochs + 1)
     epoch_bar = make_tqdm(
-        range(1, args.epochs + 1),
+        epoch_iter,
         desc="Epoch",
         position=0,
         leave=True,
         _args=args,
+        total=args.epochs,
+        initial=start_epoch,
     )
 
+    backbone_frozen: bool | None = None
+
     for epoch in epoch_bar:
+        freeze_active = args.freeze_backbone_epochs > 0 and epoch <= args.freeze_backbone_epochs
+        set_backbone_requires_grad(model, not freeze_active)
+        if freeze_active and backbone_frozen is not True:
+            progress_write(
+                f"INFO finetune: freezing backbone for first {args.freeze_backbone_epochs} epochs"
+            )
+            backbone_frozen = True
+        elif not freeze_active and backbone_frozen is True:
+            progress_write("INFO finetune: unfreezing backbone parameters")
+            backbone_frozen = False
+        elif backbone_frozen is None:
+            backbone_frozen = freeze_active
+
         train_sampler = train_loader.batch_sampler
         if isinstance(train_sampler, PKSampler):
             train_sampler.set_epoch(epoch)
