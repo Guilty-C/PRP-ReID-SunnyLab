@@ -1,0 +1,9 @@
+Indexed files: 12936
+Skipped during indexing: 0
+IDs kept: 736
+Images kept (full_clean): 12852
+IDs dropped (< min_imgs): 15
+IDs dropped (junk -1): 0
+Rejected blur: 19
+Rejected tiny: 0
+Rejected dupes: 23
