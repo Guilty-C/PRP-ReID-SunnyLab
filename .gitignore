@@ -28,3 +28,9 @@ datasets/
 outputs/
 
 # BUT we will force-add a few small, important artifacts below (manifests/splits)
+
+# extra virtual envs
+.venv*/
+
+# washer temp manifests
+/tools/market1501_wash/*.csv
