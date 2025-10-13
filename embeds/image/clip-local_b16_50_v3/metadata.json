@@ -1,0 +1,7 @@
+{
+  "provider": "clip-local",
+  "modality": "image",
+  "dim": 512,
+  "l2_normalized": true,
+  "created": "2025-10-13T03:31:24"
+}

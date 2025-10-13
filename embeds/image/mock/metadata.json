@@ -1,0 +1,7 @@
+{
+  "provider": "mock",
+  "modality": "image",
+  "dim": 512,
+  "l2_normalized": true,
+  "created": "2025-10-13T02:01:58"
+}

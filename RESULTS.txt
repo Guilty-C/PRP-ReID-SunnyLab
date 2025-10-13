@@ -1,0 +1,4 @@
+embeds/text/clip-l14_50.fused.gallery.npy
+embeds/text/clip-l14_50.fused.centroids.npy
+data/prompts/market-50.labels.fused.txt
+data/prompts/market-50.auto_v3.l14.jsonl
