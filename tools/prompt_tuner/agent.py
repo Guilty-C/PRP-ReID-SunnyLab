@@ -1,27 +1,23 @@
-"""Prompt tuning agent CLI.
-
-This module exposes a simple loop that prints tuned prompts across multiple
-rounds. The agent can optionally duplicate prompts via an ensemble factor and
-sprinkle negative safety clauses at random.
-"""
+"""Prompt tuning agent CLI."""
 from __future__ import annotations
 
 import argparse
-import random
-from typing import Iterable, List
+import logging
+from pathlib import Path
+import sys
+from typing import List
 
-NEGATIVE_CLAUSES: List[str] = [
-    "no occlusion",
-    "not blurry",
-    "no heavy shadow",
-    "no back-view if uncertain",
-    "no accessories unless clearly visible",
-]
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from tools.prompt_tuner.augment import AugmentConfig, augment_prompts
 
 DEFAULT_PROMPTS: List[str] = [
     "Describe the person succinctly while focusing on clearly visible cues.",
     "Highlight colors, clothing types, and obvious accessories in the description.",
 ]
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _float_in_unit_interval(value: str) -> float:
@@ -46,53 +42,33 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _augment_prompts(base_prompts: Iterable[str], ensemble: int, neg_rate: float) -> List[str]:
-    """Return an augmented prompt list.
-
-    Args:
-        base_prompts: The raw prompts to replicate.
-        ensemble: Number of variants to generate per base prompt.
-        neg_rate: Probability of appending a negative clause to a variant.
-    """
-
-    prompts: List[str] = []
-    base_list = list(base_prompts)
-
-    if not base_list:
-        return prompts
-
-    for prompt in base_list:
-        stripped = prompt.strip()
-        if not stripped:
-            continue
-
-        for replica_idx in range(ensemble):
-            variant = stripped
-            if ensemble > 1:
-                variant = f"{variant} (variant {replica_idx + 1})"
-
-            if neg_rate > 0.0 and random.random() < neg_rate:
-                clause = random.choice(NEGATIVE_CLAUSES)
-                sanitized = variant.rstrip()
-                if sanitized and sanitized[-1] in ".!?":
-                    variant = f"{sanitized} {clause}."
-                else:
-                    variant = f"{sanitized}, {clause}."
-
-            prompts.append(variant)
-
-    return prompts
-
-
 def _build_base_prompts(args: argparse.Namespace) -> List[str]:
     if args.prompt:
-        return args.prompt
+        return list(args.prompt)
     return DEFAULT_PROMPTS.copy()
+
+
+def _resolve_config(args: argparse.Namespace) -> AugmentConfig:
+    return AugmentConfig(
+        ensemble=args.ensemble,
+        neg_rate=args.neg_rate,
+        seed=args.seed,
+        deterministic=args.deterministic_augment,
+    )
 
 
 def run_agent(args: argparse.Namespace) -> List[List[str]]:
     base_prompts = _build_base_prompts(args)
-    augmented_prompts = _augment_prompts(base_prompts, args.ensemble, args.neg_rate)
+    cfg = _resolve_config(args)
+    augmented_prompts = augment_prompts(base_prompts, cfg)
+
+    LOGGER.info(
+        "Prepared %d prompts across %d base entries (ensemble=%d, neg_rate=%.2f)",
+        len(augmented_prompts),
+        len(base_prompts),
+        cfg.ensemble,
+        cfg.neg_rate,
+    )
 
     rounds: List[List[str]] = []
     for _ in range(args.rounds):
@@ -119,17 +95,25 @@ def main(argv: List[str] | None = None) -> None:
         default=1,
         help=(
             "Number of prompt variants to produce per base prompt. "
-            "Use 1 to keep existing behaviour (no replication)."
+            "Use 1 to keep existing behaviour (no replication).",
         ),
     )
     parser.add_argument(
-        "--neg_rate",
+        "--neg-rate",
+        dest="neg_rate",
         type=_float_in_unit_interval,
         default=0.0,
         help=(
             "Probability for appending a safety-focused negative clause to each variant. "
-            "Set to 0 to preserve current prompts."
+            "Set to 0 to preserve current prompts.",
         ),
+    )
+    parser.add_argument(
+        "--neg_rate",
+        dest="neg_rate",
+        type=_float_in_unit_interval,
+        default=0.0,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--seed",
@@ -137,11 +121,23 @@ def main(argv: List[str] | None = None) -> None:
         default=None,
         help="Optional random seed for reproducible augmentation.",
     )
+    parser.add_argument(
+        "--no-deterministic-augment",
+        dest="deterministic_augment",
+        action="store_false",
+        default=True,
+        help="Disable deterministic augmentation even when a seed is provided.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("INFO", "DEBUG", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging verbosity for the agent (default: INFO).",
+    )
 
     parsed = parser.parse_args(argv)
 
-    if parsed.seed is not None:
-        random.seed(parsed.seed)
+    logging.basicConfig(level=getattr(logging, parsed.log_level))
 
     rounds = run_agent(parsed)
     for round_idx, prompts in enumerate(rounds, start=1):
