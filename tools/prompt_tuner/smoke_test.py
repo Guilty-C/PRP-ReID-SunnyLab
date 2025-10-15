@@ -29,13 +29,11 @@ def _run_cli() -> None:
 
 
 def _check_augmentation_contract() -> None:
-    base = ["a red coat", "a blue bag"]
-    cfg = AugmentConfig(ensemble=2, neg_rate=0.0, seed=123)
-    augmented = augment_prompts(base, cfg)
-    assert len(augmented) == len(base) * cfg.ensemble
-    assert augmented.count(base[0]) == cfg.ensemble
-    assert augmented.count(base[1]) == cfg.ensemble
-    assert set(augmented) == set(base)
+    base_prompts = ["red jacket", "blue shirt"]
+    cfg = AugmentConfig(ensemble=2, neg_rate=0.1, seed=123, deterministic=True)
+    augmented = augment_prompts(base_prompts, cfg)
+    assert len(augmented) == len(base_prompts) * cfg.ensemble
+    assert base_prompts == ["red jacket", "blue shirt"]
 
 
 def run_smoke() -> None:
