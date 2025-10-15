@@ -95,7 +95,7 @@ def main(argv: List[str] | None = None) -> None:
         default=1,
         help=(
             "Number of prompt variants to produce per base prompt. "
-            "Use 1 to keep existing behaviour (no replication).",
+            "Use 1 to keep existing behaviour (no replication)."
         ),
     )
     parser.add_argument(
@@ -105,7 +105,7 @@ def main(argv: List[str] | None = None) -> None:
         default=0.0,
         help=(
             "Probability for appending a safety-focused negative clause to each variant. "
-            "Set to 0 to preserve current prompts.",
+            "Set to 0 to preserve current prompts."
         ),
     )
     parser.add_argument(
@@ -130,20 +130,20 @@ def main(argv: List[str] | None = None) -> None:
     )
     parser.add_argument(
         "--log-level",
-        choices=("INFO", "DEBUG", "WARNING", "ERROR"),
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
         help="Logging verbosity for the agent (default: INFO).",
     )
 
     parsed = parser.parse_args(argv)
 
-    logging.basicConfig(level=getattr(logging, parsed.log_level))
+    logging.basicConfig(level=getattr(logging, parsed.log_level), format="%(message)s")
 
     rounds = run_agent(parsed)
     for round_idx, prompts in enumerate(rounds, start=1):
-        print(f"Round {round_idx}:")
+        LOGGER.info("Round %d:", round_idx)
         for prompt in prompts:
-            print(f"- {prompt}")
+            LOGGER.info("- %s", prompt)
 
 
 if __name__ == "__main__":
