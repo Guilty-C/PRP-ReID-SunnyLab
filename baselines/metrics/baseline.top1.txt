@@ -1,0 +1,3 @@
+Texts: 50  Images: 861
+Average Top-1 Similarity: 0.1565
+Rank-1 (optional): 0.0000
