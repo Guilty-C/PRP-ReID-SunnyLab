@@ -1,0 +1,14 @@
+{
+  "name": "market50_vitl14_datacomp_baseline",
+  "text": {
+    "path": "embeds/text/baseline.clip-l14_50.datacomp.npy",
+    "sha256": "d3835121f564f6502d1bc99c880ec0d07098231cfc28764a8722fbe79f63ac21"
+  },
+  "image": {
+    "path": "embeds/image/baseline.market_subset50.datacomp.npy",
+    "sha256": "529584a8b124bd33b727eca704396c6e51b6e9379b74c72d82166e959235d8b6"
+  },
+  "labels_text": "baselines/labels/market1501.images.labels_subset50_centroids.baseline.txt",
+  "labels_image": "baselines/labels/market1501.images.labels_subset50.paths.baseline.txt",
+  "metrics": "baselines/metrics/baseline.cmc_map.json"
+}
