@@ -1,0 +1,21 @@
+{
+  "name": "B_baseline_market50_vitl14_datacomp",
+  "created_at": "2025-10-17T20:09:42",
+  "model": {
+    "vision_text": "ViT-L-14",
+    "pretrained": "datacomp_xl_s13b_b90k"
+  },
+  "files": {
+    "text_embed": "embeds\\text\\baseline.clip-l14_50.datacomp.npy",
+    "image_embed": "embeds\\image\\baseline.market_subset50.datacomp.npy",
+    "labels_text": "data\\market1501.images.labels_subset50_centroids.baseline.txt",
+    "labels_image": "data\\market1501.images.labels_subset50.paths.baseline.txt",
+    "prompts_jsonl": "data\\prompts\\market-50.baseline.jsonl",
+    "metrics": "outputs\\metrics\\baseline.cmc_map.json"
+  },
+  "dataset_note": "Market-1501 test subset50 (861 imgs, 50 IDs); DataComp-L/14, L2, 顺序对齐",
+  "metrics": {
+    "Rank-1": 0.06,
+    "mAP": 0.043315962970355136
+  }
+}
